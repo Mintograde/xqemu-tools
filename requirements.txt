@@ -1,0 +1,6 @@
+numpy
+#git+git://github.com/n1nj4sec/memorpy
+#git+git://github.com/matslindh/memorpy@python3-compatibility
+./memorpy
+psutil
+git+https://github.com/dpallot/simple-websocket-server.git
