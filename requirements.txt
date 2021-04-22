@@ -4,3 +4,6 @@ numpy
 ./memorpy
 psutil
 git+https://github.com/dpallot/simple-websocket-server.git
+SimpleWebSocketServer
+pymem
+psycopg2
