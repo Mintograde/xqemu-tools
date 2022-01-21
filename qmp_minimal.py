@@ -15,9 +15,13 @@ See https://discord.com/channels/680221390359887933/722155756622708744/817878951
             I'm wondering what can be done to avoid that. I'm sending memory read commands, so I'd like to avoid ignoring those responses if possible. (I'm currently working around it by setting a timeout, but it's happening so frequently (every few hundred commands) that I'm hoping there's a more robust solution than dropping data).
 
          Mintograde: I'll usually get through a couple hundred commands before I hit a timeout
+
+The HMP command `x` does not have a QMP counterpart, so we need to use a `human-monitor-command` to run x
+
 """
 
 import socket
+from pprint import pprint
 
 from qmp import QEMUMonitorProtocol
 
@@ -28,15 +32,17 @@ q.settimeout(0.5)
 command = {'execute': 'human-monitor-command', 'arguments': {'command-line': 'x /4xb 3124520'}}
 count = 0
 
-while True:
-    try:
-        count += 1
-        response = q.cmd_obj(command)
-        # print(f'{response} {count}')
-    except socket.timeout:
-        print(f'Timed out on command {count}')
-        break
+pprint(q.cmd_obj({ "execute": "query-commands" }))
 
-    import time
-    # if count % 2 == 0:
-    time.sleep(0.002)
+# while True:
+#     try:
+#         count += 1
+#         response = q.cmd_obj(command)
+#         print(f'{response} {count}')
+#     except socket.timeout:
+#         print(f'Timed out on command {count}')
+#         break
+#
+#     import time
+#     # if count % 2 == 0:
+#     time.sleep(0.002)
