@@ -1,10 +1,11 @@
 import datetime
 
-import psycopg2
+import psycopg
 
 
 class DBConnector:
 
+    # TODO: look into questdb https://questdb.io/get-questdb/
     SRID = 3857  # EPSG:3857 = Google Mercator, EPSG:3395 = World Mercator
     CONNECTION_STRING = "postgres://postgres:postgres@localhost:5432/halo"
 
@@ -15,7 +16,7 @@ class DBConnector:
 
     def connect(self):
 
-        self.conn = psycopg2.connect(self.CONNECTION_STRING)
+        self.conn = psycopg.connect(self.CONNECTION_STRING)
 
     def create_initial_tables(self):
         """
@@ -28,7 +29,10 @@ class DBConnector:
                            time TIMESTAMPTZ NOT NULL,
                            player INTEGER,
                            tick INTEGER,
-                           location geometry(POINTZ, 3857)
+                           location geometry(POINTZ, 3857),
+                           x REAL,
+                           y REAL,
+                           z REAL
                            );"""
 
         hypertable_query = "SELECT create_hypertable('player_data', 'time');"
@@ -47,6 +51,14 @@ class DBConnector:
             cur.execute(query, query_vars)
             self.conn.commit()
 
+    def insert_player_data_list(self, data_list):
+
+        with self.conn.cursor() as cur:
+            query = "INSERT INTO player_data (time, player, tick, location) VALUES (%s, %s, %s, ST_SetSRID(ST_MakePoint(%s, %s, %s), 3857))"
+            cur.executemany(query, data_list)
+            self.conn.commit()
+
+
     def insert_test_data(self):
         """
         https://gis.stackexchange.com/questions/108533/insert-a-point-into-postgis-using-python
@@ -60,6 +72,19 @@ class DBConnector:
             location=(22, 11, 5),
         )
         self.insert_player_data(data)
+
+
+    # def find_points_within_box(self, x, y, z):
+    #     """
+    #     From comment here, min/max should be faster than spatial contains queries
+    #         https://gis.stackexchange.com/a/126636
+    #     :param y:
+    #     :param z:
+    #     :return:
+    #     """
+    #
+    #     with self.conn.cursor() as cur:
+    #         query =
 
 
 if __name__ == '__main__':
