@@ -10,7 +10,8 @@ https://discord.com/channels/680221390359887933/680221390359888154/7936889995747
 https://discord.com/channels/680221390359887933/680221390359888154/793691505474666537
 https://discord.com/channels/680221390359887933/680221390359888154/817137037836288030
 
-
+player controls:
+![img.png](img.png)
 
 accessing memory from a tcg plugin:
 https://qemu.readthedocs.io/en/latest/devel/tcg-plugins.html
@@ -18,6 +19,7 @@ https://github.com/qemu/qemu/tree/master/tcg
 https://stackoverflow.com/questions/60821772/qemu-plugin-functions-how-to-access-guest-memory-and-registers
 
 
+https://github.com/csauve/guiltyspark/blob/master/HaloBot/Game/Structures.cs
 
 
 qmp.py from qemu source:

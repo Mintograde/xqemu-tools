@@ -12,9 +12,11 @@ Just dumping some early 2019 experiments based on JayFox/xbox7887/Cyrix's stuff
 Most of the requirements/imports are not required...
 
 
-##TimescaleDB setup (Vagrant/Docker):
+## TimescaleDB setup (Vagrant/Docker):
 
 Official docs for timescaledb docker configuration https://docs.timescale.com/latest/getting-started/installation/docker/installation-docker
+
+Note: timescale-timescaledb-postgis image is no longer maintained. Use https://hub.docker.com/r/timescale/timescaledb-ha
 
 ```
 # install docker on vm, run timescaledb on docker
@@ -30,7 +32,7 @@ docker exec -it timescale-timescaledb-postgis psql -U postgres
 \dx
 
 # install postgis extension if not installed
-CREATE EXTENSION postgis;
+CREATE EXTENSION IF NOT EXISTS postgis;
 
 # set up password
 # TODO: do this in a secure manner
@@ -40,6 +42,6 @@ ALTER USER postgres PASSWORD 'postgres';
 \q
 ```
 
-##Some wishlist items
+## Some wishlist items
 - track non-player objects in database as well (thrown grenades, dropped/naded weapons, fired rockets, etc)
 - user-defined map-specific regions to query against (e.g. "dammy pit" or "hangem trench")

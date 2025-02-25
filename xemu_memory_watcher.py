@@ -28,12 +28,19 @@ class QMPMessenger:
 
 class XemuInstance:
     """
-
+    Needs:
+        pid
+        known_addresses
+        memory_cache
+        qmp_instance
+    TODO: each instance gets its own local halo_data?
+            we'll need some kind of meta game instance to coalesce data from multiple xemu instances
     """
 
     def __init__(self, pid=None, qmp_address=None, qmp_port=None):
 
         self.pid = pid
+        self._memory_cache = {}
 
         if qmp_address and qmp_port:
             self.qmp_instance = QMPMessenger(qmp_address, qmp_port)
