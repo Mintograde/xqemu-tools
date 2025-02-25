@@ -9,7 +9,9 @@ Vagrant.configure("2") do |config|
 
     # https://hub.docker.com/r/timescale/timescaledb-postgis
     config.vm.provision "docker" do |d|
-        d.run "timescale/timescaledb-postgis",
+        # timescale/timescaledb-postgis is no longer maintained, use timescale/timescaledb-ha instead
+        # d.run "timescale/timescaledb-postgis",
+        d.run "timescale/timescaledb-ha",
             args: "-p 5432:5432 --env TIMESCALEDB_TELEMETRY=off"
     end
 
