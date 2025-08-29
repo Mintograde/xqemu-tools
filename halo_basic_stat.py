@@ -2320,10 +2320,11 @@ def send_to_file(data, outfile, compression=''):
     
     # TODO: better serialization of datetime
     # json.dump(data, outfile, default=str)
-    # FIXME: create directories if they don't exist
+    os.makedirs(os.path.dirname(outfile), exist_ok=True)
     if compression:
         # TODO: also generate versioned schema
         data_bytes = json.dumps(data, default=str).encode()
+        print(f'Saving {len(data_bytes)} bytes to {outfile}')
         if compression == 'gz':
             with gzip.open(outfile, 'wb') as f:
                 f.write(data_bytes)
@@ -2344,6 +2345,7 @@ def send_to_file(data, outfile, compression=''):
     else:
         with open(outfile, 'a') as f:
             # f.write(orjson.dumps(data, option=orjson.OPT_INDENT_2 | orjson.OPT_NON_STR_KEYS).decode())
+            print(f'Saving uncompressed to {outfile}')
             json.dump(data, f, default=str)
             f.write('\n')
 
@@ -2481,12 +2483,15 @@ game_time_address = game_time_globals_address + 12
 # in practice, game_info will only be called once per tick (as soon as tick changes)
 #
 # above equals roughly 3700 average pymem reads per tick (111000/second)
+#     (update 2025: ~6400 pymem reads per tick with new pc, in normal loop, py3.11) (1.73x)
 # compared to only 8 qmp calls per tick (250/second)
 # note: qmp calls are rate limited by adjusting Test.request_rate_seconds
 #       with no rate limiting, speed is 25 qmp calls per tick (750/second)
 #
-#   go is ~7x as fast, at ~26000 memory reads per tick (when running in GoLand)
-# rust is ~9x as fast, at ~34000 memory reads per tick (when running in CLion)
+#   go is ~7x as fast, at ~26000 memory reads per tick (when running in GoLand -- xemu-tools-go)
+#      (update 2025: ~55000 memory reads per tick with new pc) (2.12x)
+# rust is ~9x as fast, at ~34000 memory reads per tick (when running in CLion -- xemu-tools-rust)
+#      (update 2025: ~64000 memory reads per tick with new pc) (1.88x)
 
 # thingy = read_float(0x2714D8)  # the thing that gets subtracted from v4 in observer_pass_time()
 #  observed values:
@@ -2987,6 +2992,8 @@ def main_loop():
     last_game_info = {}
     events = []
     duration_total = 0
+
+    print(f'game_time host address: {hex(get_host_address(game_time_address))}')
 
     while True:
 
