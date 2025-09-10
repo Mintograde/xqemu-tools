@@ -19,6 +19,7 @@ import brotli
 import psutil
 from pymem.exception import MemoryReadError
 
+import api_client
 import ui
 # from database import DBConnector
 from qmp import QEMUMonitorProtocol
@@ -2369,6 +2370,7 @@ def send_to_database(game_info, db):
 game_info_queue = queue.Queue()
 game_info_queue_for_ui = queue.Queue()
 write_queue_from_ui = queue.Queue()
+api_client_queue = queue.Queue()
 
 
 def handle_game_info_loop():
@@ -2969,6 +2971,27 @@ def process_write_queue():
 # tr = tracker.SummaryTracker()
 
 
+def get_summary(game_info):
+
+    return dict(
+        game_id=game_info['game_id'],
+        status=dict(
+            game_time=game_info['game_time_info']['game_time'],
+            map_name=game_info['multiplayer_map_name'],
+            players=[dict(
+                name=player['name'],
+                team=player['team'],
+                score=player['score'],
+                kills=player['kills'],
+                deaths=player['deaths'],
+                assists=player['assists'],
+                damage_dealt=game_info['game_meta']['players'][player['player_index']]['damage_dealt'] if 'game_meta' in game_info else 0,
+                damage_received=game_info['game_meta']['players'][player['player_index']]['damage_received'] if 'game_meta' in game_info else 0,
+            ) for player in game_info['players']],
+        )
+    )
+
+
 def main_loop():
     """
     Basic flow is:
@@ -2992,6 +3015,8 @@ def main_loop():
     last_game_info = {}
     events = []
     duration_total = 0
+    last_status_sent = 0
+    status_interval = 30 * 10
 
     print(f'game_time host address: {hex(get_host_address(game_time_address))}')
 
@@ -3081,6 +3106,12 @@ def main_loop():
                 # deep copy is needed since we're modifying game_info on the other side of the queue
                 game_info_queue.put(copy.deepcopy(game_info))
                 game_info_queue_for_ui.put(game_info)
+
+                if (game_time > last_status_sent + status_interval and game_info['game_engine_can_score']) or game_info['game_ended_this_tick']:
+                    api_client_queue.put(get_summary(game_info))
+                    last_status_sent = game_time
+                elif game_time < last_status_sent:
+                    last_status_sent = 0
 
                 # analyze_offset_map()
 
@@ -3174,6 +3205,9 @@ if __name__ == '__main__':
 
     ui_thread = threading.Thread(target=ui.start_ui, args=(game_info_queue_for_ui,write_queue_from_ui,), daemon=True, name='ui_thread')
     ui_thread.start()
+
+    api_client_thread = threading.Thread(target=api_client.start_client, args=(api_client_queue,), daemon=True, name='api_client_thread')
+    api_client_thread.start()
 
     # asyncio.run(main_loop())
     main_loop()
