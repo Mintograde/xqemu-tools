@@ -30,6 +30,7 @@ necessary_fields = dict(
     ticks=dict(
         game_type={},
         variant={},
+        game_engine_has_teams={},
         multiplayer_map_name={},
         game_time_info=dict(
             game_time={},

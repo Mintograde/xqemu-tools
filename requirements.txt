@@ -19,3 +19,14 @@ pympler
 mem_edit
 #vgamepad
 pysimdjson
+clickhouse-connect
+houseplant
+httpx
+
+# testing s3 uploads
+requests
+cryptography
+boto3
+fastapi
+uvicorn[standard]
+websockets

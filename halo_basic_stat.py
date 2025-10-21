@@ -21,6 +21,7 @@ from pymem.exception import MemoryReadError
 
 import api_client
 import ui
+import ws_client
 # from database import DBConnector
 from qmp import QEMUMonitorProtocol
 import sys
@@ -37,6 +38,21 @@ import zstandard as zstd
 from SimpleWebSocketServer import SimpleWebSocketServer, WebSocket
 
 from pymem import Pymem
+
+
+XEMU_WAIT_INTERVAL_SECONDS = 1
+WEBSOCKET_HOST = 'localhost'
+WEBSOCKET_PORT = 9000
+QMP_HOST = 'localhost'
+QMP_PORT = 4444
+QMP_RATE_LIMIT_ENABLED = False
+QMP_RATE_LIMIT_SECONDS = 0.005
+REPLAY_DIRECTORY = 'V:/replays'
+REPLAY_COMPRESSION = 'zstd'
+COMPRESS_IN_MEMORY = True
+API_UPDATE_INTERVAL_SECONDS = 30 * 10
+WS_RELAY_ENABLED = True
+WS_RELAY_BASE_URL = os.getenv('WS_RELAY_BASE_URL', 'http://127.0.0.1:8787')
 
 
 def get_pid():
@@ -69,8 +85,8 @@ def wait_for_xemu():
 
         pid = get_pid()
         if pid is None:
-            print('waiting 1 more seconds for xemu to start')
-            time.sleep(1)
+            print(f'waiting {XEMU_WAIT_INTERVAL_SECONDS} more seconds for xemu to start')
+            time.sleep(XEMU_WAIT_INTERVAL_SECONDS)
             continue
         print(f'xemu pid is {pid} ({hex(pid)})')
         # pm = Pymem('xemu.exe')
@@ -101,7 +117,7 @@ class SimpleWSServer(WebSocket):
 
 def run_websocket_server():
     global server
-    server = SimpleWebSocketServer('0.0.0.0', 9000, SimpleWSServer,
+    server = SimpleWebSocketServer(WEBSOCKET_HOST, WEBSOCKET_PORT, SimpleWSServer,
                                    selectInterval=(1000.0 / 60) / 1000)
     print('Websocket server started', server.serversocket)
     server.serveforever()
@@ -151,8 +167,8 @@ class QmpProxy:
     """
 
     last_request_time = datetime.datetime.now()
-    rate_limit_enabled = False
-    request_rate_seconds = 0.005  # minimum seconds between requests
+    rate_limit_enabled = QMP_RATE_LIMIT_ENABLED
+    request_rate_seconds = QMP_RATE_LIMIT_SECONDS  # minimum seconds between requests
     # request_rate_seconds = 0.000
     cmd_counter = 0
     cmd_counter_reset = datetime.datetime.now()
@@ -168,7 +184,7 @@ class QmpProxy:
             if i > 0:
                 time.sleep(1)
             try:
-                self._qmp = QEMUMonitorProtocol(('localhost', 4444))
+                self._qmp = QEMUMonitorProtocol((QMP_HOST, QMP_PORT))
                 self._qmp.connect()
                 self._qmp.settimeout(0.5)
             except Exception as e:
@@ -1679,6 +1695,25 @@ def arrange_objects_by_type(objects):
     return objects_meta
 
 
+def get_map_info():
+
+    map_header_address = 0x2DFC98 - 4820
+
+    return dict(
+        address=hex(get_host_address(map_header_address)),
+        cache_version=read_u32(map_header_address + 0x4),
+        file_size=read_u32(map_header_address + 0x8),
+        padding_length=read_u32(map_header_address + 0xC),
+        tag_data_offset=read_u32(map_header_address + 0x10),
+        tag_data_size=read_u32(map_header_address + 0x14),
+        scenario_name=read_string(map_header_address + 0x20, 32),
+        build_version=read_string(map_header_address + 0x40, 32),
+        scenario_type=read_u16(map_header_address + 0x60),
+        checksum=read_u32(map_header_address + 0x64),
+        # bytes=get_formatted_bytes(map_header_address, 2048)
+    )
+
+
 def get_game_info():
 
     # FIXME: also support campaign (e.g. prisoner bots)
@@ -2189,6 +2224,7 @@ def get_game_info():
         # network_game_server_state=read_s16(read_u32(0x2E3628) + 0x4),  # 1 = ingame
                                                                        # 2 = postgame
                                                                        # 0 = picking map?
+        map_info=get_map_info(),
         game_connection=read_s16(0x2E3684),
         # network_game_client=read_u8(read_u32(0x2E362C)),
         game_engine_has_teams=read_u8(0x2F90C4),
@@ -2313,8 +2349,14 @@ def get_game_data():
 
 
 def send_to_api(filename):
-
     pass
+    # try:
+    #     from replay_manager import handle_new_replay_file
+    #     ok = handle_new_replay_file(filename)
+    #     if not ok:
+    #         print(f"send_to_api: upload failed for {filename}")
+    # except Exception as e:
+    #     print(f"send_to_api: error while uploading {filename}: {e}")
 
 
 def send_to_file(data, outfile, compression=''):
@@ -2371,6 +2413,7 @@ game_info_queue = queue.Queue()
 game_info_queue_for_ui = queue.Queue()
 write_queue_from_ui = queue.Queue()
 api_client_queue = queue.Queue()
+ws_client_queue = queue.Queue()
 
 
 def handle_game_info_loop():
@@ -2441,15 +2484,15 @@ def handle_game_info_loop():
             if game_info['game_ended_this_tick']:
                 pprint(game['summary'])
                 # TODO: do this in a separate process, or async -- need to resume tick capture as soon as we can
-                filename = f'V:/replays/{game_id}_final.json.zst'
-                send_to_file(game, filename, compression='zstd')
+                filename = os.path.join(REPLAY_DIRECTORY, f'{game_id}_final.json.zst')
+                send_to_file(game, filename, compression=REPLAY_COMPRESSION)
                 send_to_api(filename)
-                # send_to_file(game, f'V:/replays/{game_id}_final.json.br', compression='br')
-                # send_to_file(game, f'V:/replays/{game_id}_final.json.gz', compression='gz')
+                # send_to_file(game, f'{REPLAY_DIRECTORY}/{game_id}_final.json.br', compression='br')
+                # send_to_file(game, f'{REPLAY_DIRECTORY}/{game_id}_final.json.gz', compression='gz')
                 game_ticks = []
 
                 gc.collect()
-            # send_to_file(game_info, f'V:/replays/{game_id}.jsonl')
+            # send_to_file(game_info, f'{REPLAY_DIRECTORY}/{game_id}.jsonl')
             # send_to_file(game_info, f'C:/tmp/replays/{game_id}.jsonl')
 
 
@@ -2972,6 +3015,9 @@ def process_write_queue():
 
 
 def get_summary(game_info):
+    """
+    This summary gets sent periodically to the halospawns api for the "games in progress" page.
+    """
 
     return dict(
         game_id=game_info['game_id'],
@@ -3016,7 +3062,6 @@ def main_loop():
     events = []
     duration_total = 0
     last_status_sent = 0
-    status_interval = 30 * 10
 
     print(f'game_time host address: {hex(get_host_address(game_time_address))}')
 
@@ -3107,7 +3152,10 @@ def main_loop():
                 game_info_queue.put(copy.deepcopy(game_info))
                 game_info_queue_for_ui.put(game_info)
 
-                if (game_time > last_status_sent + status_interval and game_info['game_engine_can_score']) or game_info['game_ended_this_tick']:
+                if WS_RELAY_ENABLED:
+                    ws_client_queue.put(game_info)
+
+                if (game_time > last_status_sent + API_UPDATE_INTERVAL_SECONDS and game_info['game_engine_can_score']) or game_info['game_ended_this_tick']:
                     api_client_queue.put(get_summary(game_info))
                     last_status_sent = game_time
                 elif game_time < last_status_sent:
@@ -3208,6 +3256,18 @@ if __name__ == '__main__':
 
     api_client_thread = threading.Thread(target=api_client.start_client, args=(api_client_queue,), daemon=True, name='api_client_thread')
     api_client_thread.start()
+
+    ws_client_thread = threading.Thread(
+        target=ws_client.start_client,
+        args=(ws_client_queue,),
+        kwargs={
+            'host': WS_RELAY_BASE_URL,
+            'room': 'test-room',
+        },
+        daemon=True,
+        name='ws_client_thread'
+    )
+    ws_client_thread.start()
 
     # asyncio.run(main_loop())
     main_loop()
