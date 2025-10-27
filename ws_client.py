@@ -1,10 +1,12 @@
 import asyncio
+import base64
 import json
 import time
 from queue import Queue, Empty
 from urllib.parse import quote
 
 import websockets
+import zstandard as zstd
 import orjson
 
 
@@ -44,6 +46,13 @@ async def send_from_queue(ws, state, msg_queue: Queue):
     """
     print("[ws_client] Sender loop started.")
     try:
+        max_buffer_size = 30
+        max_message_delay_seconds = 0.2
+        seconds_since_last_message = 0
+        buffer = []
+        buffer_messages = True
+        compress_messages = True
+
         while True:
             try:
                 payload = msg_queue.get_nowait()
@@ -52,9 +61,7 @@ async def send_from_queue(ws, state, msg_queue: Queue):
                     print("[ws_client][send] Shutdown signal received.")
                     break
 
-                # TODO: optionally wrap the original message (like {"meta": {}, "payload": {}}, instead of passing it along as-is
-                # TODO: optionally batch (e.g. collect 10 game info messages and send them in a single websocket message)
-                # TODO: optionally compress the messages (e.g. the top level / meta dict is uncompressed, but the embedded payload ends up as a compressed string as base64)
+                # TODO: send message to websocket server if it's been too longs since we've gotten a message from the queue
                 if state.get("require_key") or state.get("always_include_key"):
                     if state.get("producer_key"):
                         if isinstance(payload, dict):
@@ -62,7 +69,25 @@ async def send_from_queue(ws, state, msg_queue: Queue):
                         else:
                             print(f"[ws_client][warn] Cannot add key to non-dict payload: {payload!r}")
 
-                await ws.send(orjson.dumps(payload, option=orjson.OPT_NON_STR_KEYS).decode())
+                if buffer_messages:
+                    buffer.append(payload)
+
+                if payload['game_ended_this_tick'] or len(buffer) >= max_buffer_size or not buffer_messages:
+
+                    if buffer_messages:
+                        message = dict(meta={}, payload=buffer)
+                    else:
+                        message = payload
+
+                    if compress_messages:
+                        compressor = zstd.ZstdCompressor(level=1)
+                        message_bytes = compressor.compress(orjson.dumps(message, option=orjson.OPT_NON_STR_KEYS))
+                        message = base64.b64encode(message_bytes).decode()
+                    else:
+                        message = orjson.dumps(message, option=orjson.OPT_NON_STR_KEYS).decode()
+
+                    await ws.send(message)
+                    buffer = []
 
             except Empty:
                 await asyncio.sleep(0.01)
