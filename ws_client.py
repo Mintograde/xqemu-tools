@@ -2,13 +2,20 @@ import asyncio
 import base64
 import json
 from queue import Queue, Empty
+from typing import Unpack, TypedDict
 from urllib.parse import quote
 
+import orjson
 import websockets
 import zstandard as zstd
-import orjson
 
-from typing import Unpack, TypedDict
+DEFAULT_SETTINGS = dict(
+    host='ws://127.0.0.1:8787',
+    room='test-room',
+    buffer_messages=True,
+    compress_messages=True,
+    max_buffer_size=30,
+)
 
 
 class ClientBaseKwargs(TypedDict, total=False):
@@ -57,9 +64,9 @@ async def send_from_queue(
     state,
     msg_queue: Queue,
     *,
-    buffer_messages: bool = True,
-    compress_messages: bool = True,
-    max_buffer_size: int = 30,
+    buffer_messages: bool = DEFAULT_SETTINGS["buffer_messages"],
+    compress_messages: bool = DEFAULT_SETTINGS["compress_messages"],
+    max_buffer_size: int = DEFAULT_SETTINGS["max_buffer_size"],
 ):
     """
     Pulls messages from the queue and sends them to the websocket server.
@@ -121,8 +128,10 @@ async def run_client(msg_queue: Queue, host: str, room: str, **kwargs: Unpack[Cl
     """
     preempt_key = kwargs.get("preempt_key", None)
     always_include_key = kwargs.get("always_include_key", False)
+    buffer_messages = kwargs.get("buffer_messages", DEFAULT_SETTINGS["compress_messages"])
+    compress_messages = kwargs.get("compress_messages", DEFAULT_SETTINGS["max_buffer_size"])
 
-    uri = f"{host}/ws/{quote(room)}?role=producer"
+    uri = f"{host}/ws/{quote(room)}?role=producer&compress_messages={quote(str(compress_messages))}&buffer_messages={quote(str(buffer_messages))}"
 
     headers = {}
     if preempt_key:
@@ -174,7 +183,7 @@ async def run_client(msg_queue: Queue, host: str, room: str, **kwargs: Unpack[Cl
         await asyncio.sleep(5)
 
 
-def start_client(msg_queue: Queue, host: str = "ws://127.0.0.1:8787", room: str = "test-room", **kwargs: Unpack[ClientKwargs]):
+def start_client(msg_queue: Queue, host: str = DEFAULT_SETTINGS['host'], room: str = DEFAULT_SETTINGS['room'], **kwargs: Unpack[ClientKwargs]):
     """
     Entry point to be called in a background thread.
     Sets up and runs the asyncio event loop for the websocket client.
