@@ -3260,10 +3260,12 @@ if __name__ == '__main__':
     ws_client_thread = threading.Thread(
         target=ws_client.start_client,
         args=(ws_client_queue,),
-        kwargs={
-            'host': WS_RELAY_BASE_URL,
-            'room': 'test-room',
-        },
+        kwargs=dict(
+            host=WS_RELAY_BASE_URL,
+            room='test-room',
+            buffer_messages=True,
+            compress_messages=True,
+        ),
         daemon=True,
         name='ws_client_thread'
     )

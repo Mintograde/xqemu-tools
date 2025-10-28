@@ -1,17 +1,12 @@
 import asyncio
 import base64
 import json
-import time
 from queue import Queue, Empty
 from urllib.parse import quote
 
 import websockets
 import zstandard as zstd
 import orjson
-
-
-def now_ms():
-    return int(time.time() * 1000)
 
 
 async def recv_loop(ws, state):
@@ -40,21 +35,26 @@ async def recv_loop(ws, state):
         print("[ws_client] Receiver loop finished.")
 
 
-async def send_from_queue(ws, state, msg_queue: Queue):
+async def send_from_queue(
+    ws,
+    state,
+    msg_queue: Queue,
+    *,
+    buffer_messages: bool = True,
+    compress_messages: bool = True,
+    max_buffer_size: int = 30,
+):
     """
     Pulls messages from the queue and sends them to the websocket server.
     """
     print("[ws_client] Sender loop started.")
     try:
-        max_buffer_size = 30
-        max_message_delay_seconds = 0.2
-        seconds_since_last_message = 0
         buffer = []
-        buffer_messages = True
-        compress_messages = True
 
         while True:
             try:
+                if (s := msg_queue.qsize()) > 1:
+                    print(f'[ws_client] inbound message queue size: {s}')
                 payload = msg_queue.get_nowait()
 
                 if payload is None:
@@ -98,10 +98,13 @@ async def send_from_queue(ws, state, msg_queue: Queue):
         print("[ws_client] Sender loop finished.")
 
 
-async def run_client(msg_queue: Queue, host: str, room: str, preempt_key: str = None, always_include_key: bool = False):
+async def run_client(msg_queue: Queue, host: str, room: str, **kwargs):
     """
     The main async function that manages the connection and tasks.
     """
+    preempt_key = kwargs.get("preempt_key", None)
+    always_include_key = kwargs.get("always_include_key", False)
+
     uri = f"{host}/ws/{quote(room)}?role=producer"
 
     headers = {}
@@ -133,7 +136,7 @@ async def run_client(msg_queue: Queue, host: str, room: str, preempt_key: str = 
                     print(f"[ws_client][warn] Unexpected first message: {raw!r}")
 
                 recv_task = asyncio.create_task(recv_loop(ws, state))
-                send_task = asyncio.create_task(send_from_queue(ws, state, msg_queue))
+                send_task = asyncio.create_task(send_from_queue(ws, state, msg_queue, **kwargs))
 
                 done, pending = await asyncio.wait(
                     [recv_task, send_task],
@@ -158,11 +161,6 @@ def start_client(msg_queue: Queue, host: str = "ws://127.0.0.1:8787", room: str 
     """
     Entry point to be called in a background thread.
     Sets up and runs the asyncio event loop for the websocket client.
-
-    :param msg_queue: The queue to receive messages from. Send `None` to this queue to shut down.
-    :param host: The websocket server host.
-    :param room: The room name to connect to.
-    :param kwargs: Optional arguments like 'preempt_key' and 'always_include_key'.
     """
     print(f"[ws_client] Thread starting for room '{room}'.")
     try:
