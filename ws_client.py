@@ -8,6 +8,23 @@ import websockets
 import zstandard as zstd
 import orjson
 
+from typing import Unpack, TypedDict
+
+
+class ClientBaseKwargs(TypedDict, total=False):
+    preempt_key: str
+    always_include_key: bool
+
+
+class SendKwargs(TypedDict, total=False):
+    buffer_messages: bool
+    compress_messages: bool
+    max_buffer_size: int
+
+
+class ClientKwargs(ClientBaseKwargs, SendKwargs, total=False):
+    pass
+
 
 async def recv_loop(ws, state):
     """
@@ -98,7 +115,7 @@ async def send_from_queue(
         print("[ws_client] Sender loop finished.")
 
 
-async def run_client(msg_queue: Queue, host: str, room: str, **kwargs):
+async def run_client(msg_queue: Queue, host: str, room: str, **kwargs: Unpack[ClientKwargs]):
     """
     The main async function that manages the connection and tasks.
     """
@@ -157,7 +174,7 @@ async def run_client(msg_queue: Queue, host: str, room: str, **kwargs):
         await asyncio.sleep(5)
 
 
-def start_client(msg_queue: Queue, host: str = "ws://127.0.0.1:8787", room: str = "test-room", **kwargs):
+def start_client(msg_queue: Queue, host: str = "ws://127.0.0.1:8787", room: str = "test-room", **kwargs: Unpack[ClientKwargs]):
     """
     Entry point to be called in a background thread.
     Sets up and runs the asyncio event loop for the websocket client.
