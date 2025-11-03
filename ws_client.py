@@ -17,6 +17,7 @@ DEFAULT_SETTINGS = dict(
     room='test-room',
     buffer_messages=True,
     compress_messages=True,
+    compress_messages_binary=True,
     max_buffer_size=30,
     include_all_fields=False,
 )
@@ -30,6 +31,7 @@ class ClientBaseKwargs(TypedDict, total=False):
 class SendKwargs(TypedDict, total=False):
     buffer_messages: bool
     compress_messages: bool
+    compress_messages_binary: bool
     max_buffer_size: int
 
 
@@ -70,6 +72,7 @@ async def send_from_queue(
     *,
     buffer_messages: bool = DEFAULT_SETTINGS["buffer_messages"],
     compress_messages: bool = DEFAULT_SETTINGS["compress_messages"],
+    compress_messages_binary: bool = DEFAULT_SETTINGS["compress_messages_binary"],
     max_buffer_size: int = DEFAULT_SETTINGS["max_buffer_size"],
     include_all_fields: bool = DEFAULT_SETTINGS["include_all_fields"],
 ):
@@ -115,7 +118,10 @@ async def send_from_queue(
                     if compress_messages:
                         compressor = zstd.ZstdCompressor(level=1)
                         message_bytes = compressor.compress(orjson.dumps(message, option=orjson.OPT_NON_STR_KEYS))
-                        message = base64.b64encode(message_bytes).decode()
+                        if compress_messages_binary:
+                            message = message_bytes
+                        else:
+                            message = base64.b64encode(message_bytes).decode()
                     else:
                         message = orjson.dumps(message, option=orjson.OPT_NON_STR_KEYS).decode()
 
@@ -139,8 +145,14 @@ async def run_client(msg_queue: Queue, host: str, room: str, **kwargs: Unpack[Cl
     always_include_key = kwargs.get("always_include_key", False)
     buffer_messages = kwargs.get("buffer_messages", DEFAULT_SETTINGS["buffer_messages"])
     compress_messages = kwargs.get("compress_messages", DEFAULT_SETTINGS["compress_messages"])
+    compress_messages_binary = kwargs.get("compress_messages_binary", DEFAULT_SETTINGS["compress_messages_binary"])
 
-    uri = f"{host}/ws/{quote(room)}?role=producer&compress_messages={quote(str(compress_messages))}&buffer_messages={quote(str(buffer_messages))}"
+    uri = (
+        f"{host}/ws/{quote(room)}?role=producer"
+        f"&compress_messages={quote(str(compress_messages))}"
+        f"&compress_messages_binary={quote(str(compress_messages_binary))}"
+        f"&buffer_messages={quote(str(buffer_messages))}"
+    )
 
     headers = {}
     if preempt_key:
