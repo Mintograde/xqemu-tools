@@ -58,6 +58,10 @@ necessary_fields = dict(
             suicides={},
             score={},
             ctf_score={},
+            damage_table=dict(
+                damage_time={},
+                damage_amount={},
+            ),
             observer_camera_info=dict(
                 x={},
                 y={},
@@ -81,8 +85,17 @@ necessary_fields = dict(
             object_type_string={},
         ),
         object_meta={},
+        game_ended_this_tick={},
     )
 )
+
+necessary_fields_live = necessary_fields['ticks'].copy()
+necessary_fields_live.update(dict(
+    events=necessary_fields['events'].copy(),
+    spawns=necessary_fields['spawns'].copy(),
+    items=necessary_fields['items'].copy(),
+))
+
 necessary_fields_dotted = [
     'summary.*',
     'game_meta.*',
@@ -229,7 +242,7 @@ def strip_json_dotted(data, field_specs, path=""):
         return data  # Base case: just return the value
 
 
-def strip_json(data, fields):
+def _strip_json(data, fields):
 
     if isinstance(data, dict):
         # Check if we want to keep everything in this structure
@@ -237,19 +250,27 @@ def strip_json(data, fields):
             return data  # Return the entire dictionary as-is
 
         # Recursively process the dictionary, but skip empty results
-        result = {k: strip_json(v, fields.get(k, {})) for k, v in data.items() if k in fields}
+        result = {k: _strip_json(v, fields.get(k, {})) for k, v in data.items() if k in fields}
         # Remove empty dictionaries
         # return {k: v for k, v in result.items() if v != {}}
         return {k: v for k, v in result.items()}
 
     elif isinstance(data, list):
         # Recursively process lists, and filter out empty or None results
-        result = [strip_json(item, fields) for item in data]
+        result = [_strip_json(item, fields) for item in data]
         return [item for item in result if item != {}]
 
     else:
         # Base case: return the value for non-dict/list types
         return data
+
+
+def strip_replay(replay_data):
+    return _strip_json(replay_data, necessary_fields)
+
+
+def strip_tick(tick_data):
+    return _strip_json(tick_data, necessary_fields_live)
 
 
 def process_compressed_replay(input_filename, output_folder):
@@ -278,7 +299,7 @@ def process_compressed_replay(input_filename, output_folder):
     replay_dict = json.loads(json_bytes.decode('utf-8'))
     # extract_locations(replay_dict)
 
-    stripped_replay = strip_json(replay_dict, necessary_fields)
+    stripped_replay = strip_replay(replay_dict)
     with open(os.path.join(output_folder, f'{input_base_name}_stripped.json'), 'w') as o:
         json.dump(stripped_replay, o)
 

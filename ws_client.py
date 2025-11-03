@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import copy
 import json
 from queue import Queue, Empty
 from typing import Unpack, TypedDict
@@ -9,12 +10,15 @@ import orjson
 import websockets
 import zstandard as zstd
 
+from replay_utils import strip_tick
+
 DEFAULT_SETTINGS = dict(
     host='ws://127.0.0.1:8787',
     room='test-room',
     buffer_messages=True,
     compress_messages=True,
     max_buffer_size=30,
+    include_all_fields=False,
 )
 
 
@@ -67,6 +71,7 @@ async def send_from_queue(
     buffer_messages: bool = DEFAULT_SETTINGS["buffer_messages"],
     compress_messages: bool = DEFAULT_SETTINGS["compress_messages"],
     max_buffer_size: int = DEFAULT_SETTINGS["max_buffer_size"],
+    include_all_fields: int = DEFAULT_SETTINGS["include_all_fields"],
 ):
     """
     Pulls messages from the queue and sends them to the websocket server.
@@ -84,6 +89,10 @@ async def send_from_queue(
                 if payload is None:
                     print("[ws_client][send] Shutdown signal received.")
                     break
+
+                if not include_all_fields:
+                    payload_copy = copy.deepcopy(payload)
+                    payload = strip_tick(payload_copy)
 
                 # TODO: send message to websocket server if it's been too longs since we've gotten a message from the queue
                 if state.get("require_key") or state.get("always_include_key"):
@@ -128,8 +137,8 @@ async def run_client(msg_queue: Queue, host: str, room: str, **kwargs: Unpack[Cl
     """
     preempt_key = kwargs.get("preempt_key", None)
     always_include_key = kwargs.get("always_include_key", False)
-    buffer_messages = kwargs.get("buffer_messages", DEFAULT_SETTINGS["compress_messages"])
-    compress_messages = kwargs.get("compress_messages", DEFAULT_SETTINGS["max_buffer_size"])
+    buffer_messages = kwargs.get("buffer_messages", DEFAULT_SETTINGS["buffer_messages"])
+    compress_messages = kwargs.get("compress_messages", DEFAULT_SETTINGS["compress_messages"])
 
     uri = f"{host}/ws/{quote(room)}?role=producer&compress_messages={quote(str(compress_messages))}&buffer_messages={quote(str(buffer_messages))}"
 
