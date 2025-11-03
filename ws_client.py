@@ -71,7 +71,7 @@ async def send_from_queue(
     buffer_messages: bool = DEFAULT_SETTINGS["buffer_messages"],
     compress_messages: bool = DEFAULT_SETTINGS["compress_messages"],
     max_buffer_size: int = DEFAULT_SETTINGS["max_buffer_size"],
-    include_all_fields: int = DEFAULT_SETTINGS["include_all_fields"],
+    include_all_fields: bool = DEFAULT_SETTINGS["include_all_fields"],
 ):
     """
     Pulls messages from the queue and sends them to the websocket server.
