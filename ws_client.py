@@ -18,6 +18,7 @@ DEFAULT_SETTINGS = dict(
     buffer_messages=True,
     compress_messages=True,
     compress_messages_binary=True,
+    compression_level=12,
     max_buffer_size=30,
     include_all_fields=False,
 )
@@ -73,6 +74,7 @@ async def send_from_queue(
     buffer_messages: bool = DEFAULT_SETTINGS["buffer_messages"],
     compress_messages: bool = DEFAULT_SETTINGS["compress_messages"],
     compress_messages_binary: bool = DEFAULT_SETTINGS["compress_messages_binary"],
+    compression_level: int = DEFAULT_SETTINGS["compression_level"],
     max_buffer_size: int = DEFAULT_SETTINGS["max_buffer_size"],
     include_all_fields: bool = DEFAULT_SETTINGS["include_all_fields"],
 ):
@@ -116,7 +118,11 @@ async def send_from_queue(
                         message = payload
 
                     if compress_messages:
-                        compressor = zstd.ZstdCompressor(level=1)
+                        # compressed size (1v1 single-tick message):
+                        #   level 1: 9.3 kB; level 12: 8.5 kB; level 22: 8.0 kB
+                        # processing time (1v1 single-tick message):
+                        #   level 1: 0.001366s; level 12: 0.001827s; level 22: 0.009744s
+                        compressor = zstd.ZstdCompressor(level=compression_level)
                         message_bytes = compressor.compress(orjson.dumps(message, option=orjson.OPT_NON_STR_KEYS))
                         if compress_messages_binary:
                             message = message_bytes
