@@ -77,6 +77,7 @@ async def send_from_queue(
     compression_level: int = DEFAULT_SETTINGS["compression_level"],
     max_buffer_size: int = DEFAULT_SETTINGS["max_buffer_size"],
     include_all_fields: bool = DEFAULT_SETTINGS["include_all_fields"],
+    **kwargs,
 ):
     """
     Pulls messages from the queue and sends them to the websocket server.
@@ -138,6 +139,9 @@ async def send_from_queue(
                 await asyncio.sleep(0.01)
             except websockets.ConnectionClosed:
                 print("[ws_client][send] Connection closed while sending.")
+                break
+            except Exception as e:
+                print(f"[ws_client][send] Unexpected error: {e!r}")
                 break
     finally:
         print("[ws_client] Sender loop finished.")
@@ -206,6 +210,17 @@ async def run_client(msg_queue: Queue, host: str, room: str, **kwargs: Unpack[Cl
             print(f"[ws_client][error] Connection failed: {e}. Retrying in 5 seconds...")
         except Exception as e:
             print(f"[ws_client][error] An unexpected error occurred: {e!r}. Retrying in 5 seconds...")
+
+        dropped = 0
+        while not msg_queue.empty():
+            try:
+                msg_queue.get_nowait()
+                dropped += 1
+            except Empty:
+                break
+
+        if dropped > 0:
+            print(f"[ws_client][warn] Disconnected: Flushed {dropped} stale messages from queue.")
 
         await asyncio.sleep(5)
 
