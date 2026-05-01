@@ -53,6 +53,9 @@ COMPRESS_IN_MEMORY = True
 API_UPDATE_INTERVAL_SECONDS = 30 * 10
 WS_RELAY_ENABLED = True
 WS_RELAY_BASE_URL = os.getenv('WS_RELAY_BASE_URL', 'http://127.0.0.1:8787')
+ENABLE_UI = True
+ENABLE_API_CLIENT = False
+ENABLE_WEBSOCKET_RELAY = True
 
 
 def get_pid():
@@ -766,7 +769,6 @@ game_connection_address = 0x2E3684
 is_team_game_address = read_u8(0x2F90C4)
 game_time_globals_address = read_u32(0x2F8CA0)
 global_tag_instances_address = read_u32(0x39CE24)
-# game_globals_276 = read_u32(game_globals_address + 276)
 # game_globals_276_108 = read_u16(game_globals_address + 108)
 hud_messages_pointer = read_u32(0x276B40)
 
@@ -1207,6 +1209,10 @@ def get_input_data(local_player_index, player_id):
     player_control_address = read_u32(0x276794)
     # player_id = local_player_index
 
+    game_globals_player_control_address = read_u32(global_game_globals_address + 276)
+    global_friction = read_float(game_globals_player_control_address)
+    global_adhesion = read_float(game_globals_player_control_address + 0x4)
+
     update_client_player_address = read_u32(read_u32(0x2E8870) + 0x34)
     button_field = read_u8(update_client_player_address + 0x28 * player_id + 0x4)
     action_field = read_u8(update_client_player_address + 0x28 * player_id + 0x5)
@@ -1230,6 +1236,10 @@ def get_input_data(local_player_index, player_id):
             player_aim_assist_target=hex(read_u32((local_player_index << 6) + player_control_address + 16 + 0x28)),
             player_aim_assist_near=read_float((local_player_index << 6) + player_control_address + 16 + 0x2C),
             player_aim_assist_far=read_float((local_player_index << 6) + player_control_address + 16 + 0x30),
+            global_friction=global_friction,
+            global_adhesion=global_adhesion,
+            friction_coeff=1.0 - read_float((local_player_index << 6) + player_control_address + 16 + 0x30) * global_friction,
+            adhesion_coeff=read_float((local_player_index << 6) + player_control_address + 16 + 0x30) * global_adhesion,
         ) if local_player_index != -1 else {},
 
         # input_abstraction is after button/joystick layouts are applied (e.g. actions, not buttons)
@@ -2430,7 +2440,7 @@ def handle_game_info_loop():
 
     game_ticks = []
     events = []
-    store_all_ticks = True
+    store_all_ticks = False
 
     # FIXME: try/catch for common or potential exceptions here -- need to keep this thread alive or restart if it dies
 
@@ -3251,25 +3261,30 @@ if __name__ == '__main__':
     # main_thread = threading.Thread(target=main_loop, daemon=True, name='main_loop_thread')
     # main_thread.start()
 
-    ui_thread = threading.Thread(target=ui.start_ui, args=(game_info_queue_for_ui,write_queue_from_ui,), daemon=True, name='ui_thread')
-    ui_thread.start()
+    if ENABLE_UI:
+        ui_thread = threading.Thread(target=ui.start_ui, args=(game_info_queue_for_ui,write_queue_from_ui,), daemon=True, name='ui_thread')
+        ui_thread.start()
 
-    api_client_thread = threading.Thread(target=api_client.start_client, args=(api_client_queue,), daemon=True, name='api_client_thread')
-    api_client_thread.start()
+    if ENABLE_API_CLIENT:
+        api_client_thread = threading.Thread(target=api_client.start_client, args=(api_client_queue,), daemon=True, name='api_client_thread')
+        api_client_thread.start()
 
-    ws_client_thread = threading.Thread(
-        target=ws_client.start_client,
-        args=(ws_client_queue,),
-        kwargs=dict(
-            host=WS_RELAY_BASE_URL,
-            room='test-room',
-            buffer_messages=True,
-            compress_messages=True,
-        ),
-        daemon=True,
-        name='ws_client_thread'
-    )
-    ws_client_thread.start()
+    if ENABLE_WEBSOCKET_RELAY:
+        ws_client_thread = threading.Thread(
+            target=ws_client.start_client,
+            args=(ws_client_queue,),
+            kwargs=dict(
+                # host=WS_RELAY_BASE_URL,
+                room='test-room',
+                buffer_messages=False,
+                compress_messages=True,
+                # include_all_fields=True,
+                # max_buffer_size=30,
+            ),
+            daemon=True,
+            name='ws_client_thread'
+        )
+        ws_client_thread.start()
 
     # asyncio.run(main_loop())
     main_loop()
