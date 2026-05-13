@@ -1,8 +1,10 @@
 import asyncio
 import base64
 import copy
+import datetime
 import json
 from queue import Queue, Empty
+import time
 from typing import Unpack, TypedDict
 from urllib.parse import quote
 
@@ -21,7 +23,12 @@ DEFAULT_SETTINGS = dict(
     compression_level=12,
     max_buffer_size=30,
     include_all_fields=False,
+    send_live_status=True,
+    live_status_interval_seconds=10,
 )
+
+LIVE_STATUS_TICKS_PER_SECOND = 30
+LIVE_STATUS_TERMINAL_STATUSES = {"postgame", "ended", "stale"}
 
 
 class ClientBaseKwargs(TypedDict, total=False):
@@ -33,7 +40,11 @@ class SendKwargs(TypedDict, total=False):
     buffer_messages: bool
     compress_messages: bool
     compress_messages_binary: bool
+    compression_level: int
     max_buffer_size: int
+    include_all_fields: bool
+    send_live_status: bool
+    live_status_interval_seconds: int
 
 
 class ClientKwargs(ClientBaseKwargs, SendKwargs, total=False):
@@ -66,6 +77,156 @@ async def recv_loop(ws, state):
         print("[ws_client] Receiver loop finished.")
 
 
+def _optional_string(value):
+    if value is None:
+        return None
+    value = str(value).strip()
+    return value or None
+
+
+def _optional_int(value):
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _isoformat(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime.datetime):
+        return value.isoformat()
+    return _optional_string(value)
+
+
+def _game_status(game_info):
+    if game_info.get("game_ended_this_tick"):
+        return "ended"
+    if game_info.get("game_engine_can_score"):
+        return "live"
+    if game_info.get("game_engine_running"):
+        return "waiting"
+    return "stale"
+
+
+def _player_damage(game_info, player_index, field):
+    try:
+        return game_info["game_meta"]["players"][player_index][field]
+    except (KeyError, TypeError):
+        return 0
+
+
+def _player_summary(game_info):
+    players = []
+    for player in game_info.get("players") or []:
+        player_index = player.get("player_index")
+        derived_stats = player.get("derived_stats") or {}
+        players.append(dict(
+            player_index=player_index,
+            name=player.get("name"),
+            team_index=player.get("team"),
+            local_player=player.get("local_player"),
+            score=player.get("score"),
+            kills=player.get("kills"),
+            deaths=player.get("deaths"),
+            assists=player.get("assists"),
+            team_kills=player.get("team_kills"),
+            suicides=player.get("suicides"),
+            respawn_timer=player.get("respawn_timer"),
+            has_camo=bool(derived_stats.get("has_camo")),
+            has_overshield=bool(derived_stats.get("has_overshield")),
+            damage_dealt=_player_damage(game_info, player_index, "damage_dealt"),
+            damage_received=_player_damage(game_info, player_index, "damage_received"),
+        ))
+    return players
+
+
+def _team_summary(game_info, player_summary):
+    if not game_info.get("game_engine_has_teams"):
+        return []
+
+    teams = {}
+    for player in player_summary:
+        team_index = player.get("team_index")
+        if team_index is None:
+            continue
+        team = teams.setdefault(team_index, dict(
+            team_index=team_index,
+            player_count=0,
+            score=0,
+            kills=0,
+            deaths=0,
+        ))
+        team["player_count"] += 1
+        team["score"] += player.get("score") or 0
+        team["kills"] += player.get("kills") or 0
+        team["deaths"] += player.get("deaths") or 0
+
+    return [teams[key] for key in sorted(teams)]
+
+
+def build_live_status_message(game_info):
+    game_time_info = game_info.get("game_time_info") or {}
+    current_tick = _optional_int(game_time_info.get("game_time"))
+    game_id = _optional_string(game_info.get("game_id"))
+    player_summary = _player_summary(game_info)
+    map_info = game_info.get("map_info") or {}
+
+    return dict(
+        type="live_status",
+        status=_game_status(game_info),
+        source_external_id=game_id,
+        game_type=_optional_string(game_info.get("game_type")),
+        variant_name=_optional_string(game_info.get("global_stage")),
+        started_at=_isoformat(game_info.get("start_time")),
+        observed_at=_isoformat(game_info.get("current_time")),
+        current_game_time_seconds=(
+            current_tick / LIVE_STATUS_TICKS_PER_SECOND
+            if current_tick is not None and current_tick >= 0
+            else None
+        ),
+        current_tick=current_tick,
+        player_summary=player_summary,
+        team_summary=_team_summary(game_info, player_summary),
+        raw_status=dict(
+            game_engine_running=game_info.get("game_engine_running"),
+            game_engine_can_score=game_info.get("game_engine_can_score"),
+            game_ended_this_tick=game_info.get("game_ended_this_tick"),
+        ),
+        game_metadata=dict(
+            source="xqemu-tools",
+            legacy_game_id=game_id,
+            map_name=game_info.get("multiplayer_map_name"),
+            map_info=dict(
+                scenario_name=map_info.get("scenario_name"),
+                checksum=map_info.get("checksum"),
+                build_version=map_info.get("build_version"),
+            ),
+            game_type=game_info.get("game_type"),
+            variant=game_info.get("variant"),
+            game_engine_has_teams=game_info.get("game_engine_has_teams"),
+        ),
+    )
+
+
+def _add_key_if_needed(payload, state):
+    if state.get("require_key") or state.get("always_include_key"):
+        if state.get("producer_key"):
+            if isinstance(payload, dict):
+                payload["key"] = state["producer_key"]
+            else:
+                print(f"[ws_client][warn] Cannot add key to non-dict payload: {payload!r}")
+
+
+async def send_live_status_message(ws, state, live_status):
+    message = copy.deepcopy(live_status)
+    message["observed_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    _add_key_if_needed(message, state)
+    await ws.send(orjson.dumps(message).decode())
+
+
 async def send_from_queue(
     ws,
     state,
@@ -77,6 +238,8 @@ async def send_from_queue(
     compression_level: int = DEFAULT_SETTINGS["compression_level"],
     max_buffer_size: int = DEFAULT_SETTINGS["max_buffer_size"],
     include_all_fields: bool = DEFAULT_SETTINGS["include_all_fields"],
+    send_live_status: bool = DEFAULT_SETTINGS["send_live_status"],
+    live_status_interval_seconds: int = DEFAULT_SETTINGS["live_status_interval_seconds"],
     **kwargs,
 ):
     """
@@ -85,6 +248,10 @@ async def send_from_queue(
     print("[ws_client] Sender loop started.")
     try:
         buffer = []
+        last_live_status = None
+        last_live_status_sent_at = 0.0
+        last_live_status_game_id = None
+        terminal_status_sent_for_game_id = None
 
         while True:
             try:
@@ -96,17 +263,38 @@ async def send_from_queue(
                     print("[ws_client][send] Shutdown signal received.")
                     break
 
+                if send_live_status:
+                    live_status = build_live_status_message(payload)
+                    live_status_game_id = (
+                        live_status.get("source_external_id")
+                        or live_status.get("started_at")
+                        or "__unknown__"
+                    )
+                    if live_status_game_id != last_live_status_game_id:
+                        terminal_status_sent_for_game_id = None
+                        last_live_status_game_id = live_status_game_id
+
+                    last_live_status = live_status
+                    live_status_is_terminal = live_status.get("status") in LIVE_STATUS_TERMINAL_STATUSES
+                    live_status_due = (
+                        time.monotonic() >= last_live_status_sent_at + live_status_interval_seconds
+                    )
+                    terminal_status_due = (
+                        live_status_is_terminal
+                        and terminal_status_sent_for_game_id != live_status_game_id
+                    )
+
+                    if terminal_status_due or (live_status_due and not live_status_is_terminal):
+                        await send_live_status_message(ws, state, live_status)
+                        last_live_status_sent_at = time.monotonic()
+                        if live_status_is_terminal:
+                            terminal_status_sent_for_game_id = live_status_game_id
+
                 if not include_all_fields:
                     payload_copy = copy.deepcopy(payload)
                     payload = strip_tick(payload_copy)
 
-                # TODO: send message to websocket server if it's been too longs since we've gotten a message from the queue
-                if state.get("require_key") or state.get("always_include_key"):
-                    if state.get("producer_key"):
-                        if isinstance(payload, dict):
-                            payload["key"] = state["producer_key"]
-                        else:
-                            print(f"[ws_client][warn] Cannot add key to non-dict payload: {payload!r}")
+                _add_key_if_needed(payload, state)
 
                 if buffer_messages:
                     buffer.append(payload)
@@ -136,6 +324,14 @@ async def send_from_queue(
                     buffer = []
 
             except Empty:
+                if (
+                    send_live_status
+                    and last_live_status
+                    and last_live_status.get("status") not in LIVE_STATUS_TERMINAL_STATUSES
+                    and time.monotonic() >= last_live_status_sent_at + live_status_interval_seconds
+                ):
+                    await send_live_status_message(ws, state, last_live_status)
+                    last_live_status_sent_at = time.monotonic()
                 await asyncio.sleep(0.01)
             except websockets.ConnectionClosed:
                 print("[ws_client][send] Connection closed while sending.")
