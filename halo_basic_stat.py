@@ -4,6 +4,7 @@ import ctypes
 import dataclasses
 import gc
 import gzip
+import hashlib
 import json
 import lzma
 import math
@@ -56,6 +57,8 @@ WS_RELAY_BASE_URL = os.getenv('WS_RELAY_BASE_URL', 'http://127.0.0.1:8787')
 ENABLE_UI = True
 ENABLE_API_CLIENT = False
 ENABLE_WEBSOCKET_RELAY = True
+GAME_RELEASE_KEY = 'h1xbox'
+COMPUTE_SPAWN_PARAMETERS_HASH = True
 
 
 def get_pid():
@@ -2525,6 +2528,12 @@ def get_game_info():
     else:
         game_id = ''
     game_info['game_id'] = game_id
+    game_info['map_resolution_inputs'] = get_map_resolution_inputs(game_info)
+    game_info['spawn_parameters_hash'] = (
+        calculate_spawn_hash(game_info['map_resolution_inputs'])
+        if COMPUTE_SPAWN_PARAMETERS_HASH
+        else None
+    )
 
     return game_info
 
@@ -2823,6 +2832,88 @@ def distance(p1: tuple[int, int, int], p2: tuple[int, int, int]) -> float:
     x1, y1, z1 = p1
     x2, y2, z2 = p2
     return (((x2-x1)**2)+((y2-y1)**2)+((z2-z1)**2))**(1/2)
+
+
+def _canonical_float(value):
+
+    if value is None:
+        return None
+
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if not math.isfinite(value):
+        return None
+
+    return round(value, 6)
+
+
+def _canonical_int(value):
+
+    if value is None or value == '':
+        return None
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _canonical_spawn_records(spawns):
+
+    spawn_records = []
+    for spawn in spawns or []:
+        gametypes = []
+        for gametype in spawn.get('gametypes', []):
+            gametype = _canonical_int(gametype)
+            if gametype is not None:
+                gametypes.append(gametype)
+
+        spawn_records.append(dict(
+            spawn_id=_canonical_int(spawn.get('spawn_id')),
+            x=_canonical_float(spawn.get('x')),
+            y=_canonical_float(spawn.get('y')),
+            z=_canonical_float(spawn.get('z')),
+            facing=_canonical_float(spawn.get('facing')),
+            team_index=_canonical_int(spawn.get('team_index')),
+            gametypes=sorted(gametypes),
+        ))
+
+    return sorted(
+        spawn_records,
+        key=lambda spawn: (spawn['spawn_id'] is None, spawn['spawn_id'])
+    )
+
+
+def get_map_resolution_inputs(game_info):
+
+    map_info = game_info.get('map_info') or {}
+
+    return dict(
+        map_engine_name=game_info.get('multiplayer_map_name') or None,
+        game_release_key=GAME_RELEASE_KEY,
+        map_info=dict(
+            scenario_name=map_info.get('scenario_name') or None,
+            build_version=map_info.get('build_version') or None,
+            cache_version=_canonical_int(map_info.get('cache_version')),
+            checksum=_canonical_int(map_info.get('checksum')),
+        ),
+        game_type=_canonical_int(game_info.get('game_type')),
+        variant=_canonical_int(game_info.get('variant')),
+        game_engine_has_teams=bool(game_info.get('game_engine_has_teams')),
+        spawn_points=_canonical_spawn_records(game_info.get('spawns')),
+    )
+
+
+def calculate_spawn_hash(map_resolution_inputs):
+
+    canonical_json = orjson.dumps(
+        map_resolution_inputs,
+        option=orjson.OPT_SORT_KEYS,
+    )
+    return f'sha256:{hashlib.sha256(canonical_json).hexdigest()}'
 
 
 # TODO: need to list out some use cases here -- where would intentional collisions be useful, if we can just

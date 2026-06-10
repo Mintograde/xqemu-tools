@@ -173,12 +173,26 @@ def build_live_status_message(game_info):
     game_id = _optional_string(game_info.get("game_id"))
     player_summary = _player_summary(game_info)
     map_info = game_info.get("map_info") or {}
+    map_resolution_inputs = game_info.get("map_resolution_inputs") or {}
+    map_resolution_map_info = map_resolution_inputs.get("map_info") or {}
+    spawn_parameters_hash = game_info.get("spawn_parameters_hash")
+    spawn_points = map_resolution_inputs.get("spawn_points") or []
+    build_version = map_resolution_map_info.get("build_version") or map_info.get("build_version")
+    cache_version = map_resolution_map_info.get("cache_version") or map_info.get("cache_version")
 
     return dict(
         type="live_status",
         status=_game_status(game_info),
         source_external_id=game_id,
+        map_engine_name=map_resolution_inputs.get("map_engine_name") or game_info.get("multiplayer_map_name"),
+        game_release_key=map_resolution_inputs.get("game_release_key"),
+        build_version=build_version,
+        cache_version=cache_version,
+        spawn_parameters_hash=spawn_parameters_hash,
+        map_resolution_inputs=map_resolution_inputs,
+        spawn_points=spawn_points,
         game_type=_optional_string(game_info.get("game_type")),
+        variant=game_info.get("variant"),
         variant_name=_optional_string(game_info.get("global_stage")),
         started_at=_isoformat(game_info.get("start_time")),
         observed_at=_isoformat(game_info.get("current_time")),
@@ -203,10 +217,13 @@ def build_live_status_message(game_info):
                 scenario_name=map_info.get("scenario_name"),
                 checksum=map_info.get("checksum"),
                 build_version=map_info.get("build_version"),
+                cache_version=map_info.get("cache_version"),
             ),
             game_type=game_info.get("game_type"),
             variant=game_info.get("variant"),
             game_engine_has_teams=game_info.get("game_engine_has_teams"),
+            spawn_parameters_hash=spawn_parameters_hash,
+            map_resolution_inputs=map_resolution_inputs,
         ),
     )
 
@@ -251,6 +268,7 @@ async def send_from_queue(
         last_live_status = None
         last_live_status_sent_at = 0.0
         last_live_status_game_id = None
+        last_live_status_spawn_parameters_hash = None
         terminal_status_sent_for_game_id = None
 
         while True:
@@ -273,9 +291,15 @@ async def send_from_queue(
                     if live_status_game_id != last_live_status_game_id:
                         terminal_status_sent_for_game_id = None
                         last_live_status_game_id = live_status_game_id
+                        last_live_status_spawn_parameters_hash = None
 
                     last_live_status = live_status
                     live_status_is_terminal = live_status.get("status") in LIVE_STATUS_TERMINAL_STATUSES
+                    live_status_spawn_parameters_hash = live_status.get("spawn_parameters_hash")
+                    live_status_spawn_parameters_changed = (
+                        live_status_spawn_parameters_hash is not None
+                        and live_status_spawn_parameters_hash != last_live_status_spawn_parameters_hash
+                    )
                     live_status_due = (
                         time.monotonic() >= last_live_status_sent_at + live_status_interval_seconds
                     )
@@ -284,9 +308,15 @@ async def send_from_queue(
                         and terminal_status_sent_for_game_id != live_status_game_id
                     )
 
-                    if terminal_status_due or (live_status_due and not live_status_is_terminal):
+                    if (
+                        terminal_status_due
+                        or live_status_spawn_parameters_changed
+                        or (live_status_due and not live_status_is_terminal)
+                    ):
                         await send_live_status_message(ws, state, live_status)
                         last_live_status_sent_at = time.monotonic()
+                        if live_status_spawn_parameters_hash is not None:
+                            last_live_status_spawn_parameters_hash = live_status_spawn_parameters_hash
                         if live_status_is_terminal:
                             terminal_status_sent_for_game_id = live_status_game_id
 
@@ -332,6 +362,8 @@ async def send_from_queue(
                 ):
                     await send_live_status_message(ws, state, last_live_status)
                     last_live_status_sent_at = time.monotonic()
+                    if last_live_status.get("spawn_parameters_hash") is not None:
+                        last_live_status_spawn_parameters_hash = last_live_status.get("spawn_parameters_hash")
                 await asyncio.sleep(0.01)
             except websockets.ConnectionClosed:
                 print("[ws_client][send] Connection closed while sending.")
