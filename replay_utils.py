@@ -94,6 +94,7 @@ necessary_fields_live.update(dict(
     events=necessary_fields['events'].copy(),
     spawns=necessary_fields['spawns'].copy(),
     items=necessary_fields['items'].copy(),
+    gametype_settings=necessary_fields['gametype_settings'].copy(),
 ))
 
 necessary_fields_dotted = [

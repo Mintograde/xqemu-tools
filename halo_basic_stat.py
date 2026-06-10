@@ -1208,10 +1208,14 @@ def get_input_data(local_player_index, player_id):
     # FIXME: this doesn't seem to use local_player_index -- controller ports 2 and 3 are not input[1] and input[2]
     player_control_address = read_u32(0x276794)
     # player_id = local_player_index
-
-    game_globals_player_control_address = read_u32(global_game_globals_address + 276)
-    global_friction = read_float(game_globals_player_control_address)
-    global_adhesion = read_float(game_globals_player_control_address + 0x4)
+    try:
+        global_game_globals_address = read_u32(0x39BE4C)
+        game_globals_player_control_address = read_u32(global_game_globals_address + 276)
+        global_friction = read_float(game_globals_player_control_address)
+        global_adhesion = read_float(game_globals_player_control_address + 0x4)
+    except Exception as e:
+        print(f"Failed to read player control globals: {e}")
+        return {}
 
     update_client_player_address = read_u32(read_u32(0x2E8870) + 0x34)
     button_field = read_u8(update_client_player_address + 0x28 * player_id + 0x4)
@@ -1450,6 +1454,83 @@ terminator: 6,
 stub: 7,
 """
 
+gametype_names = {
+    0: 'none',
+    1: 'ctf',
+    2: 'slayer',
+    3: 'oddball',
+    4: 'king',
+    5: 'race',
+    6: 'terminator',
+    7: 'stub',
+}
+
+off_on_names = {
+    0: 'off',
+    1: 'on',
+}
+
+objective_indicator_names = {
+    0: 'motion tracker',
+    1: 'nav point',
+    2: 'none',
+}
+
+weapon_set_names = {
+    0: 'default',
+    1: 'pistols',
+    2: 'rifles',
+    3: 'plasma rifles',
+    4: 'sniper',
+    5: 'no sniper',
+    6: 'rocket launchers',
+    7: 'shotguns',
+    8: 'short range',
+    9: 'human',
+    10: 'covenant',
+    11: 'classic',
+    12: 'heavy weapons',
+}
+
+vehicle_set_names = {
+    0: 'all',
+    1: 'none',
+    2: 'warthog',
+    3: 'ghost',
+    4: 'scorpion',
+}
+
+speed_with_ball_names = {
+    0: 'slow',
+    1: 'normal',
+    2: 'fast',
+}
+
+trait_with_ball_names = {
+    0: 'none',
+    1: 'invisible',
+    2: 'extra damage',
+    3: 'damage resistance',
+}
+
+ball_type_names = {
+    0: 'normal',
+    1: 'reverse tag',
+    2: 'juggernaut',
+}
+
+race_order_names = {
+    0: 'normal',
+    1: 'any order',
+    2: 'rally',
+}
+
+race_points_used_names = {
+    0: 'minimum',
+    1: 'maximum',
+    2: 'sum',
+}
+
 team_score_addresses_by_gametype = {
     1: 0x2762B4,  # ctf
     2: 0x276710,  # slayer
@@ -1486,6 +1567,141 @@ def get_all_team_scores():
 def get_global_variant():
 
     global_variant_address = 0x2F90A8
+    data = read_bytes(global_variant_address, 0x68)
+
+    def read_from_variant(fmt, offset):
+        return struct.unpack_from(fmt, data, offset)[0]
+
+    def format_bytes(raw_data, columns=32):
+        hex_data = raw_data.hex(' ')
+        return [hex_data[i:i+3*columns].strip() for i in range(0, len(hex_data), 3*columns)]
+
+    def enum_name(names, value):
+        return names.get(value, f'unknown {value}')
+
+    def get_ctf_settings():
+        ctf_flags = read_from_variant('<I', 0x4C)
+        single_flag_time = read_from_variant('<I', 0x50)
+        return dict(
+            flags=ctf_flags,
+            assault=bool(ctf_flags & (1 << 0)),
+            flag_must_reset=bool(ctf_flags & (1 << 16)),
+            flag_must_be_at_home=bool(ctf_flags & (1 << 24)),
+            single_flag_time=single_flag_time,
+            single_flag_time_seconds=single_flag_time / 30,
+        )
+
+    def get_slayer_settings():
+        slayer_flags = read_from_variant('<I', 0x4C)
+        return dict(
+            flags=slayer_flags,
+            death_bonus=not bool(slayer_flags & (1 << 0)),
+            kill_penalty=not bool(slayer_flags & (1 << 8)),
+            kill_in_order=bool(slayer_flags & (1 << 16)),
+        )
+
+    def get_oddball_settings():
+        random_ball = data[0x4C]
+        speed_with_ball = read_from_variant('<I', 0x50)
+        trait_with_ball = read_from_variant('<I', 0x54)
+        trait_without_ball = read_from_variant('<I', 0x58)
+        ball_type = read_from_variant('<I', 0x5C)
+        return dict(
+            random_ball=random_ball,
+            random_ball_name=enum_name(off_on_names, random_ball),
+            speed_with_ball=speed_with_ball,
+            speed_with_ball_name=enum_name(speed_with_ball_names, speed_with_ball),
+            trait_with_ball=trait_with_ball,
+            trait_with_ball_name=enum_name(trait_with_ball_names, trait_with_ball),
+            trait_without_ball=trait_without_ball,
+            trait_without_ball_name=enum_name(trait_with_ball_names, trait_without_ball),
+            ball_type=ball_type,
+            ball_type_name=enum_name(ball_type_names, ball_type),
+            ball_count=read_from_variant('<I', 0x60),
+        )
+
+    def get_king_settings():
+        moving_hill = data[0x4C]
+        return dict(
+            moving_hill=moving_hill,
+            moving_hill_name=enum_name(off_on_names, moving_hill),
+        )
+
+    def get_race_settings():
+        race_order = data[0x4C]
+        points_used = read_from_variant('<I', 0x50)
+        return dict(
+            order=race_order,
+            order_name=enum_name(race_order_names, race_order),
+            points_used=points_used,
+            points_used_name=enum_name(race_points_used_names, points_used),
+        )
+
+    player_settings = read_from_variant('<I', 0x20)
+    game_type = read_from_variant('<I', 0x18)
+    teamplay = read_from_variant('<I', 0x1C)
+    odd_man_out = read_from_variant('<I', 0x28)
+    objective_indicator = read_from_variant('<I', 0x24)
+    respawn_time_growth = read_from_variant('<I', 0x2C)
+    respawn_time = read_from_variant('<I', 0x30)
+    respawn_suicide_penalty = read_from_variant('<I', 0x34)
+    health = read_from_variant('<f', 0x3C)
+    score_limit = read_from_variant('<I', 0x40)
+    weapon_set = read_from_variant('<I', 0x44)
+    vehicle_set = read_from_variant('<I', 0x48)
+    mode_settings = dict(
+        # raw_bytes=format_bytes(data[0x4C:0x68]),
+    )
+    mode_settings.update({
+        1: get_ctf_settings,
+        2: get_slayer_settings,
+        3: get_oddball_settings,
+        4: get_king_settings,
+        5: get_race_settings,
+    }.get(game_type, lambda: {})())
+
+    # still undecided on all these _name and _seconds variations
+    # maybe just send raw values and do the mapping at the replay parser (or at ingest time via db tables?)
+    # either way, we can just keep everything here and whitelist what we need via replay_utils
+    return dict(
+        address=f'{hex(global_variant_address)} -> {hex(get_host_address(global_variant_address))}',
+        # raw_bytes=format_bytes(data),
+        name=data[:24].decode('utf-16').split('\x00', 1)[0],
+        game_type=game_type,
+        mode=enum_name(gametype_names, game_type),
+        teamplay=teamplay,
+        teams_enabled=bool(teamplay),
+        teamplay_name=enum_name(off_on_names, teamplay),
+        player_settings=dict(
+            value=player_settings,
+            radar_enabled=bool(player_settings & (1 << 0)),
+            friend_on_hud=bool(player_settings & (1 << 1)),
+            infinite_grenades=bool(player_settings & (1 << 2)),
+            shields_disabled=bool(player_settings & (1 << 3)),
+            invisible=bool(player_settings & (1 << 4)),
+            generic_weapons=bool(player_settings & (1 << 5)),
+            enemies_not_on_radar=bool(player_settings & (1 << 6)),
+        ),
+        objective_indicator=objective_indicator,
+        objective_indicator_name=enum_name(objective_indicator_names, objective_indicator),
+        odd_man_out=odd_man_out,
+        odd_man_out_name=enum_name(off_on_names, odd_man_out),
+        respawn_time_growth=respawn_time_growth,
+        respawn_time_growth_seconds=respawn_time_growth / 30,
+        respawn_time=respawn_time,
+        respawn_time_seconds=respawn_time / 30,
+        respawn_suicide_penalty=respawn_suicide_penalty,
+        respawn_suicide_penalty_seconds=respawn_suicide_penalty / 30,
+        lives=read_from_variant('<I', 0x38),
+        health=health,
+        health_percent=health * 100,
+        score_limit=score_limit,
+        weapon_set=weapon_set,
+        weapon_set_name=enum_name(weapon_set_names, weapon_set),
+        vehicle_set=vehicle_set,
+        vehicle_set_name=enum_name(vehicle_set_names, vehicle_set),
+        mode_settings=mode_settings,
+    )
 
 
 def get_game_variant_global():
@@ -2228,6 +2444,7 @@ def get_game_info():
         # ),
         game_type=read_u32(game_engine_globals_address + 0x4) if game_engine_globals_address else '',
         variant=read_u8(0x2F90F4),
+        gametype_settings=get_global_variant(),
         global_stage=read_string(0x2FAC20, length=63),  # only populated for hostbox
         multiplayer_map_name=read_string(0x2E37CD),  # populated for host and join boxes
         # network_game_server=f'{hex(read_u32(read_u32(0x2E3628)))}: {hex(read_u32(read_u32(0x2E3628)))} -> {hex(get_host_address(read_u32(read_u32(0x2E3628))))}',
@@ -2440,7 +2657,7 @@ def handle_game_info_loop():
 
     game_ticks = []
     events = []
-    store_all_ticks = False
+    store_all_ticks = True
 
     # FIXME: try/catch for common or potential exceptions here -- need to keep this thread alive or restart if it dies
 
@@ -2466,6 +2683,7 @@ def handle_game_info_loop():
             spawns = game_info.pop('spawns', [])
             items = game_info.pop('items', [])
             meta = game_info.pop('game_meta', [])
+            gametype_settings = game_info.pop('gametype_settings', [])
             # objects = game_info.pop('objects', [])  # FIXME: just temporarily removing this for write performance
 
             # FIXME: PERF: storing game ticks like this uses lots of memory (~1-2MB/s)
@@ -2485,6 +2703,7 @@ def handle_game_info_loop():
                     ticks_dropped=game_ticks[-1]['game_time_info']['game_time'] - game_ticks[0]['game_time_info']['game_time'] + 1 - len(game_ticks),
                 ) if store_all_ticks else {},
                 game_meta=meta,
+                gametype_settings=gametype_settings,
                 events=events,
                 spawns=spawns,
                 items=items,
@@ -2493,14 +2712,14 @@ def handle_game_info_loop():
 
             if game_info['game_ended_this_tick']:
                 pprint(game['summary'])
-                # TODO: do this in a separate process, or async -- need to resume tick capture as soon as we can
-                filename = os.path.join(REPLAY_DIRECTORY, f'{game_id}_final.json.zst')
-                send_to_file(game, filename, compression=REPLAY_COMPRESSION)
-                send_to_api(filename)
-                # send_to_file(game, f'{REPLAY_DIRECTORY}/{game_id}_final.json.br', compression='br')
-                # send_to_file(game, f'{REPLAY_DIRECTORY}/{game_id}_final.json.gz', compression='gz')
-                game_ticks = []
-
+                if store_all_ticks:
+                    # TODO: do this in a separate process, or async -- need to resume tick capture as soon as we can
+                    filename = os.path.join(REPLAY_DIRECTORY, f'{game_id}_final.json.zst')
+                    send_to_file(game, filename, compression=REPLAY_COMPRESSION)
+                    send_to_api(filename)
+                    # send_to_file(game, f'{REPLAY_DIRECTORY}/{game_id}_final.json.br', compression='br')
+                    # send_to_file(game, f'{REPLAY_DIRECTORY}/{game_id}_final.json.gz', compression='gz')
+                    game_ticks = []
                 gc.collect()
             # send_to_file(game_info, f'{REPLAY_DIRECTORY}/{game_id}.jsonl')
             # send_to_file(game_info, f'C:/tmp/replays/{game_id}.jsonl')
@@ -3274,8 +3493,8 @@ if __name__ == '__main__':
             target=ws_client.start_client,
             args=(ws_client_queue,),
             kwargs=dict(
-                # host=WS_RELAY_BASE_URL,
-                room='test-room',
+                host=WS_RELAY_BASE_URL,
+                room='test-room2',
                 buffer_messages=False,
                 compress_messages=True,
                 # include_all_fields=True,
