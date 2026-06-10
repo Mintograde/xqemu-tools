@@ -17,6 +17,7 @@ necessary_fields = dict(
     summary={},
     game_meta={},
     events={},
+    gametype_settings={},
     spawns=dict(
         spawn_id={},
         x={},
