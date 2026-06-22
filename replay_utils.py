@@ -71,12 +71,15 @@ necessary_fields = dict(
                 y_aim={},
                 z_aim={},
                 fov={},
-
             ),
             player_object_data={},
             model_nodes={},
             derived_stats={},
             input_data={},
+            first_person_weapon=dict(
+                weapon_rendered={},
+                weapon_object_id={},
+            )
         ),
         objects=dict(
             object_id={},
@@ -84,6 +87,7 @@ necessary_fields = dict(
             y={},
             z={},
             object_type_string={},
+            tag_name={},
         ),
         object_meta={},
         game_ended_this_tick={},
@@ -330,4 +334,5 @@ if __name__ == '__main__':
 
     # test_compression()
     # process_compressed_replay(r"V:\replays\2024-11-19_20-26-03_final.json.zst")
-    process_multiple(r'V:\replays\2024*_final.json.zst', r'V:\replays\processed')
+    # process_multiple(r'V:\replays\2024*_final.json.zst', r'V:\replays\processed')
+    process_multiple(r'V:\replays\2026-06-16*_final.json.zst', r'V:\replays\processed')
