@@ -57,7 +57,6 @@ WS_RELAY_BASE_URL = os.getenv('WS_RELAY_BASE_URL', 'http://127.0.0.1:8787')
 ENABLE_UI = True
 ENABLE_API_CLIENT = False
 ENABLE_WEBSOCKET_RELAY = True
-GAME_RELEASE_KEY = 'h1xbox'
 COMPUTE_SPAWN_PARAMETERS_HASH = True
 
 
@@ -1032,6 +1031,12 @@ def get_objects():
                 vel_x=read_float(object_address + 0x18),
                 vel_y=read_float(object_address + 0x1C),
                 vel_z=read_float(object_address + 0x20),
+                forward_x=read_float(object_address + 0x24),
+                forward_y=read_float(object_address + 0x28),
+                forward_z=read_float(object_address + 0x2C),
+                up_x=read_float(object_address + 0x30),
+                up_y=read_float(object_address + 0x34),
+                up_z=read_float(object_address + 0x38),
                 ang_vel_x=read_float(object_address + 0x3C),
                 ang_vel_y=read_float(object_address + 0x40),
                 ang_vel_z=read_float(object_address + 0x44),
@@ -1356,6 +1361,7 @@ def get_first_person_weapon(local_player_index):
         weapon_rendered=read_u32(weapon_address),  # TODO: confirm if this is actually weapon_rendered
         player_object=f'{read_u32(weapon_address + 4):#x}',  # player object id?
         weapon_object=f'{read_u32(weapon_address + 8):#x}',  # weapon object id?
+        weapon_object_id=read_u32(weapon_address + 8) & 0xFFFF,
         state=read_s16(weapon_address + 12),
         idle_animation_threshold=read_s16(weapon_address + 14),
         idle_animation_counter=read_s16(weapon_address + 16),
@@ -1403,45 +1409,15 @@ def get_observer_camera_info(local_player_index):
 
 def get_model_nodes(base_address):
 
-    model_node_offsets = [
-        # 0x438,  # player location
-        0x4a8,
-        0x4dc,
-        0x510,
-        0x544,
-        0x578,
-        0x5ac,
-        0x5e0,
-        0x614,
-        0x648,
-        0x67c,
-        0x6b0,
-        0x6e4,
-        0x718,
-        0x74c,
-        0x780,
-        0x7b4,
-        0x7e8,
-        0x81c,
-        0x850,
-        # 0xd84,  # primary weapon
-        # 0xfd8,  # primary weapon
-        # 0x100c,  # primary weapon
-        # 0x1040,  # primary weapon
-        # 0x1074,  # primary weapon
-        # 0x10a8,  # primary weapon
-        # 0x10dc,  # primary weapon
-        # 0x1110,  # primary weapon
-    ]
-
+    model_node_start_offset = 0x4a8 - 0x28
+    model_node_stride = 0x34
+    model_node_count = 19
+    model_node_data = read_bytes(base_address + model_node_start_offset, model_node_stride * model_node_count)
     model_nodes = []
 
-    for offset in model_node_offsets:
-        model_nodes.append((
-            read_float(base_address + offset),
-            read_float(base_address + offset + 4),
-            read_float(base_address + offset + 8),
-        ))
+    for i in range(model_node_count):
+        values = struct.unpack_from('<13f', model_node_data, model_node_stride * i)
+        model_nodes.append((*values[10:13], values[0], *values[1:10]))
 
     return model_nodes
 
@@ -2893,7 +2869,6 @@ def get_map_resolution_inputs(game_info):
 
     return dict(
         map_engine_name=game_info.get('multiplayer_map_name') or None,
-        game_release_key=GAME_RELEASE_KEY,
         map_info=dict(
             scenario_name=map_info.get('scenario_name') or None,
             build_version=map_info.get('build_version') or None,
