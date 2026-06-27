@@ -2,20 +2,32 @@ use crate::config::Config;
 use crate::util::timedelta_seconds_floor;
 use anyhow::{Context, Result};
 use chrono::NaiveDateTime;
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, Sender};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Read;
+use std::path::Path;
 use std::thread;
+use uuid::Uuid;
 
-pub fn start_replay_worker(config: Config, receiver: Receiver<Value>) -> thread::JoinHandle<()> {
+pub fn start_replay_worker(
+    config: Config,
+    receiver: Receiver<Value>,
+    relay_sender: Sender<Value>,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        if let Err(err) = replay_worker(config, receiver) {
+        if let Err(err) = replay_worker(config, receiver, relay_sender) {
             eprintln!("[replay] worker failed: {err:#}");
         }
     })
 }
 
-fn replay_worker(config: Config, receiver: Receiver<Value>) -> Result<()> {
+fn replay_worker(
+    config: Config,
+    receiver: Receiver<Value>,
+    relay_sender: Sender<Value>,
+) -> Result<()> {
     let mut game_ticks: Vec<Value> = Vec::new();
     let mut events = Value::Array(Vec::new());
     let mut spawns = Value::Array(Vec::new());
@@ -77,9 +89,68 @@ fn replay_worker(config: Config, receiver: Receiver<Value>) -> Result<()> {
         let compressed = zstd::bulk::compress(&data_bytes, 11)?;
         fs::write(&filename, compressed)
             .with_context(|| format!("failed to write {}", filename.display()))?;
+        if config.ws_relay_enabled {
+            if let Err(err) = enqueue_replay_upload_request(&filename, &relay_sender) {
+                eprintln!(
+                    "[replay] failed to enqueue replay upload request for {}: {err:#}",
+                    safe_file_name(&filename)
+                );
+            }
+        }
         game_ticks = Vec::new();
     }
     Ok(())
+}
+
+fn enqueue_replay_upload_request(path: &Path, relay_sender: &Sender<Value>) -> Result<()> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to stat replay file {}", safe_file_name(path)))?;
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("replay file has no valid UTF-8 basename")?
+        .to_string();
+    let source_external_id = filename
+        .strip_suffix("_final.json.zst")
+        .or_else(|| filename.strip_suffix(".json.zst"))
+        .unwrap_or(&filename)
+        .to_string();
+
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("failed to open replay file {}", safe_file_name(path)))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("failed to hash replay file {}", safe_file_name(path)))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let sha256 = format!("{:x}", hasher.finalize());
+
+    relay_sender
+        .try_send(json!({
+            "type": "replay_upload_presign_request",
+            "request_id": Uuid::new_v4().to_string(),
+            "source_external_id": source_external_id,
+            "filename": filename,
+            "content_type": "application/zstd",
+            "size_bytes": metadata.len(),
+            "sha256": sha256,
+            "_local_file_path": path.to_string_lossy(),
+        }))
+        .context("failed to enqueue replay upload request")?;
+    Ok(())
+}
+
+fn safe_file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("<unknown>")
+        .to_string()
 }
 
 fn build_summary(game_id: &str, game_ticks: &[Value]) -> Value {

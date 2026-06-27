@@ -21,7 +21,7 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let _ = dotenvy::from_filename("xemu-tools-2-rs.env");
+    let _ = dotenvy::from_filename("xemu-tools-rs.env");
     let _ = dotenvy::dotenv();
     let config = Config::default();
     let xemu = process::wait_for_xemu()?;
@@ -32,10 +32,10 @@ fn main() -> Result<()> {
     let (replay_tx, replay_rx) = unbounded();
     let (local_ws_tx, local_ws_rx) = unbounded();
     let (relay_tx, relay_rx) = unbounded();
-    let _replay_worker = replay::start_replay_worker(config.clone(), replay_rx);
+    let _replay_worker = replay::start_replay_worker(config.clone(), replay_rx, relay_tx.clone());
     let _local_ws_server = ws::start_local_ws_server(config.clone(), local_ws_rx);
     let _relay_client = if config.ws_relay_enabled {
-        Some(ws::start_relay_client(config.clone(), relay_rx))
+        Some(ws::start_relay_client(config.clone(), relay_rx, relay_tx.clone()))
     } else {
         None
     };

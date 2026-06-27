@@ -37,6 +37,12 @@ necessary_fields = dict(
             game_time={},
             real_time_elapsed={},
         ),
+        map_info=dict(
+            cache_version = {},
+            build_version = {},
+            scenario_name = {},
+            checksum = {},
+        ),
         damage_counts={},
         current_time={},
         start_time={},
@@ -320,7 +326,7 @@ def process_compressed_replay(input_filename, output_folder):
     #     json.dump(stripped_replay, o)
 
     with open(os.path.join(output_folder, f'{input_base_name}_stripped.json.zst'), 'wb') as o:
-        compressor = zstd.ZstdCompressor()
+        compressor = zstd.ZstdCompressor(level=11)
         with o as compressed_file:
             compressed_file.write(compressor.compress(json.dumps(stripped_replay).encode('utf-8')))
 

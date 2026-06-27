@@ -12,6 +12,7 @@ import queue
 import re
 import threading
 import traceback
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from pprint import pprint, pformat
@@ -2561,7 +2562,25 @@ def get_game_data():
 
 
 def send_to_api(filename):
-    pass
+    if not os.path.exists(filename):
+        print(f"send_to_api: replay file does not exist: {os.path.basename(filename)}")
+        return
+    basename = os.path.basename(filename)
+    source_external_id = basename.removesuffix('_final.json.zst').removesuffix('.json.zst')
+    h = hashlib.sha256()
+    with open(filename, 'rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(chunk)
+    ws_client_queue.put(dict(
+        type='replay_upload_presign_request',
+        request_id=str(uuid.uuid4()),
+        source_external_id=source_external_id,
+        filename=basename,
+        content_type='application/zstd',
+        size_bytes=os.path.getsize(filename),
+        sha256=h.hexdigest(),
+        _local_file_path=filename,
+    ))
     # try:
     #     from replay_manager import handle_new_replay_file
     #     ok = handle_new_replay_file(filename)

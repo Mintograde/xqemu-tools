@@ -1,5 +1,5 @@
 [package]
-name = "xemu-tools-2-rs"
+name = "xemu-tools-rs"
 version = "0.1.0"
 edition = "2024"
 
@@ -11,6 +11,7 @@ crossbeam-channel = "0.5"
 dotenvy = "0.15"
 futures-util = "0.3"
 indexmap = { version = "2", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 rustls = { version = "0.23", features = ["ring"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -19,6 +20,7 @@ sysinfo = "0.36"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 urlencoding = "2"
+uuid = { version = "1", features = ["v4"] }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_Debug",

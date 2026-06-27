@@ -3,6 +3,7 @@ import base64
 import copy
 import datetime
 import json
+import urllib.request
 from queue import Queue, Empty
 import time
 from typing import Unpack, TypedDict
@@ -64,11 +65,16 @@ async def recv_loop(ws, state):
                 print(f"[ws_client][recv] non-json: {raw!r}")
                 continue
 
-            print(f"[ws_client][recv] {msg}")
-
             if isinstance(msg, dict) and msg.get("type") == "error" and msg.get("code") == "BAD_KEY":
                 state["require_key"] = True
                 print("[ws_client][info] Server requires per-message key. Will include it in subsequent messages.")
+            elif isinstance(msg, dict) and msg.get("type") == "replay_upload_presign_response":
+                print(f"[ws_client][recv] replay upload presign response request_id={msg.get('request_id')}")
+                await handle_replay_upload_presign_response(ws, state, msg)
+            elif isinstance(msg, dict) and msg.get("type") == "replay_upload_presign_error":
+                print(f"[ws_client][recv] replay upload presign error request_id={msg.get('request_id')} status={msg.get('status')} error={msg.get('error')}")
+            else:
+                print(f"[ws_client][recv] {msg}")
     except websockets.ConnectionClosed as e:
         print(f"[ws_client][recv] Connection closed: code={e.code} reason={e.reason}")
     except Exception as e:
@@ -185,7 +191,6 @@ def build_live_status_message(game_info):
         status=_game_status(game_info),
         source_external_id=game_id,
         map_engine_name=map_resolution_inputs.get("map_engine_name") or game_info.get("multiplayer_map_name"),
-        game_release_key=map_resolution_inputs.get("game_release_key"),
         build_version=build_version,
         cache_version=cache_version,
         spawn_parameters_hash=spawn_parameters_hash,
@@ -237,6 +242,54 @@ def _add_key_if_needed(payload, state):
                 print(f"[ws_client][warn] Cannot add key to non-dict payload: {payload!r}")
 
 
+def _upload_replay_file(path, presigned_request):
+    with open(path, "rb") as f:
+        data = f.read()
+    req = urllib.request.Request(
+        presigned_request["url"],
+        data=data,
+        method=presigned_request.get("method", "PUT"),
+        headers=presigned_request.get("headers") or {},
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return resp.status
+
+
+def _safe_upload_error(e):
+    status = getattr(e, "code", None) or getattr(e, "status", None)
+    reason = getattr(e, "reason", None)
+    if status:
+        return f"status={status} reason={reason}"
+    return e.__class__.__name__
+
+
+async def handle_replay_upload_presign_response(ws, state, msg):
+    request_id = msg.get("request_id")
+    pending = state.get("replay_uploads", {}).get(request_id)
+    if not pending:
+        print(f"[ws_client][upload] no local replay path for request_id={request_id}")
+        return
+    try:
+        status = await asyncio.to_thread(_upload_replay_file, pending["path"], msg["presigned_request"])
+        upload_id = (msg.get("upload") or {}).get("id")
+        ack = dict(type="replay_upload_client_status", request_id=request_id, upload_id=upload_id, status="uploaded")
+        _add_key_if_needed(ack, state)
+        await ws.send(orjson.dumps(ack).decode())
+        state["replay_uploads"].pop(request_id, None)
+        print(f"[ws_client][upload] replay uploaded request_id={request_id} status={status}")
+    except Exception as e:
+        pending["attempts"] = pending.get("attempts", 0) + 1
+        print(f"[ws_client][upload] replay upload failed request_id={request_id}: {_safe_upload_error(e)}")
+        if pending["attempts"] <= state.get("max_replay_upload_retries", 2):
+            await asyncio.sleep(min(30, 2 ** pending["attempts"]))
+            retry_payload = pending["payload"].copy()
+            _add_key_if_needed(retry_payload, state)
+            await ws.send(orjson.dumps(retry_payload).decode())
+        else:
+            state["replay_uploads"].pop(request_id, None)
+            print(f"[ws_client][upload] replay upload giving up request_id={request_id}")
+
+
 async def send_live_status_message(ws, state, live_status):
     message = copy.deepcopy(live_status)
     message["observed_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -280,6 +333,15 @@ async def send_from_queue(
                 if payload is None:
                     print("[ws_client][send] Shutdown signal received.")
                     break
+
+                if isinstance(payload, dict) and payload.get("type") == "replay_upload_presign_request":
+                    local_path = payload.pop("_local_file_path", None)
+                    request_id = payload.get("request_id")
+                    if local_path and request_id:
+                        state.setdefault("replay_uploads", {})[request_id] = dict(path=local_path, payload=payload.copy(), attempts=0)
+                    _add_key_if_needed(payload, state)
+                    await ws.send(orjson.dumps(payload).decode())
+                    continue
 
                 if send_live_status:
                     live_status = build_live_status_message(payload)
@@ -400,6 +462,8 @@ async def run_client(msg_queue: Queue, host: str, room: str, **kwargs: Unpack[Cl
         "producer_key": None,
         "require_key": False,
         "always_include_key": always_include_key,
+        "replay_uploads": {},
+        "max_replay_upload_retries": 2,
     }
 
     while True:
@@ -414,7 +478,7 @@ async def run_client(msg_queue: Queue, host: str, room: str, **kwargs: Unpack[Cl
                     if welcome.get("type") == "welcome" and welcome.get("role") == "producer":
                         state["producer_key"] = welcome.get("producerKey")
                         expires_at = welcome.get("expiresAt")
-                        print(f"[ws_client][info] Welcome: key={state['producer_key']} expiresAt={expires_at}")
+                        print(f"[ws_client][info] Welcome: producer key received expiresAt={expires_at}")
                     else:
                         print(f"[ws_client][warn] Unexpected welcome message: {welcome}")
                 except (json.JSONDecodeError, AttributeError):
@@ -440,15 +504,31 @@ async def run_client(msg_queue: Queue, host: str, room: str, **kwargs: Unpack[Cl
             print(f"[ws_client][error] An unexpected error occurred: {e!r}. Retrying in 5 seconds...")
 
         dropped = 0
+        retained_uploads = []
+        retained_upload_request_ids = set()
         while not msg_queue.empty():
             try:
-                msg_queue.get_nowait()
-                dropped += 1
+                payload = msg_queue.get_nowait()
+                if isinstance(payload, dict) and payload.get("type") == "replay_upload_presign_request":
+                    retained_uploads.append(payload)
+                    if payload.get("request_id"):
+                        retained_upload_request_ids.add(payload["request_id"])
+                else:
+                    dropped += 1
             except Empty:
                 break
+        for payload in retained_uploads:
+            msg_queue.put(payload)
+        requeued = 0
+        for request_id, pending in state.get("replay_uploads", {}).items():
+            if request_id not in retained_upload_request_ids:
+                msg_queue.put(pending["payload"].copy())
+                requeued += 1
 
         if dropped > 0:
             print(f"[ws_client][warn] Disconnected: Flushed {dropped} stale messages from queue.")
+        if requeued > 0:
+            print(f"[ws_client][warn] Disconnected: Requeued {requeued} pending replay upload requests.")
 
         await asyncio.sleep(5)
 
