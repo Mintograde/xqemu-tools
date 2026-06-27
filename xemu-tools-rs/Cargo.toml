@@ -1,33 +1,28 @@
 [package]
-name = "xemu-tools-rs"
+name = "xemu-tools-2-rs"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
-tokio = { version = "1.36", features = ["full"] }
-sysinfo = "0.33"
-anyhow = "1.0"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-eframe = "0.31"
-egui_extras = "0.31"
-egui_plot = "0.31"
-tokio-tungstenite = "0.21"
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+crossbeam-channel = "0.5"
+dotenvy = "0.15"
 futures-util = "0.3"
-zstd = "0.13"
-log = "0.4"
-env_logger = "0.11"
-regex = "1.10"
-url = "2.5"
-windows = { version = "0.52", features = [
-    "Win32_System_Threading",
-    "Win32_System_Diagnostics_Debug",
+indexmap = { version = "2", features = ["serde"] }
+rustls = { version = "0.23", features = ["ring"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+sysinfo = "0.36"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
+urlencoding = "2"
+windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
-    "Win32_System_Memory",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
 ] }
-chrono = { version = "0.4.42", features = ["serde"] }
-tokio-stream = "0.1.18"
-
-[profile.profiling]
-inherits = "release"
-debug = true
+zstd = "0.13"
