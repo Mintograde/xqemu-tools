@@ -113,7 +113,7 @@ def _game_status(game_info):
     if game_info.get("game_engine_can_score"):
         return "live"
     if game_info.get("game_engine_running"):
-        return "waiting"
+        return "postgame"
     return "stale"
 
 
@@ -345,18 +345,22 @@ async def send_from_queue(
 
                 if send_live_status:
                     live_status = build_live_status_message(payload)
-                    live_status_game_id = (
-                        live_status.get("source_external_id")
-                        or live_status.get("started_at")
-                        or "__unknown__"
-                    )
+                    live_status_status = live_status.get("status")
+                    live_status_is_live = live_status_status == "live"
+                    live_status_is_terminal = live_status_status in LIVE_STATUS_TERMINAL_STATUSES
+                    live_status_source_external_id = live_status.get("source_external_id")
+                    if live_status_source_external_id:
+                        live_status_game_id = live_status_source_external_id
+                    elif live_status_is_terminal:
+                        live_status_game_id = last_live_status_game_id or "__terminal__"
+                    else:
+                        live_status_game_id = live_status.get("started_at") or "__unknown__"
                     if live_status_game_id != last_live_status_game_id:
                         terminal_status_sent_for_game_id = None
                         last_live_status_game_id = live_status_game_id
                         last_live_status_spawn_parameters_hash = None
 
                     last_live_status = live_status
-                    live_status_is_terminal = live_status.get("status") in LIVE_STATUS_TERMINAL_STATUSES
                     live_status_spawn_parameters_hash = live_status.get("spawn_parameters_hash")
                     live_status_spawn_parameters_changed = (
                         live_status_spawn_parameters_hash is not None
@@ -372,7 +376,7 @@ async def send_from_queue(
 
                     if (
                         terminal_status_due
-                        or live_status_spawn_parameters_changed
+                        or (live_status_is_live and live_status_spawn_parameters_changed)
                         or (live_status_due and not live_status_is_terminal)
                     ):
                         await send_live_status_message(ws, state, live_status)
