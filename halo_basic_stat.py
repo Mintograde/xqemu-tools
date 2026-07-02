@@ -3122,41 +3122,50 @@ def extract_events(old_game_info: dict, new_game_info: dict) -> list:
     # TODO: check if damaging player has an active melee/nade/projectile, or has just fired this tick
     #       -- if so, try to guess damage type/weapon
     #       -- if multiple options, show options in log
+    def get_player_vitality(player):
+        data = player['player_object_data']
+        return data['health'] * data['max_health'] + data['shields'] * data['max_shields'] if data else 0.0
+
     if new_game_info['game_engine_can_score']:
         for damage_dealer, damage_receivers in new_game_info['damage_counts'].items():
             damage_dealer_name = new_game_info['players'][damage_dealer]['name']
             if damage_dealer in old_game_info['damage_counts']:
                 for damage_receiver, new_amount in damage_receivers.items():
                     damage_receiver_name = new_game_info['players'][damage_receiver]['name']
+                    max_damage = max(0.0, get_player_vitality(old_game_info['players'][damage_receiver]) - get_player_vitality(new_game_info['players'][damage_receiver]))
                     if damage_receiver in old_game_info['damage_counts'][damage_dealer]:
                         old_amount = old_game_info['damage_counts'][damage_dealer][damage_receiver]
                         if new_amount > old_amount:
-                            events.append(f'{game_time}: {damage_dealer_name} damaged {damage_receiver_name} for {new_amount - old_amount}')
+                            damage_amount = min(new_amount - old_amount, max_damage)
+                            events.append(f'{game_time}: {damage_dealer_name} damaged {damage_receiver_name} for {damage_amount}')
                             # FIXME: clean this up, lots of duplication here
-                            game_meta['players'][damage_dealer]['damage_dealt_by_tick'][game_time] += new_amount - old_amount
-                            game_meta['players'][damage_receiver]['damage_received_by_tick'][game_time] += new_amount - old_amount
-                            game_meta['players'][damage_dealer]['damage_to_player'][damage_receiver] += new_amount - old_amount
-                            game_meta['players'][damage_receiver]['damage_from_player'][damage_dealer] += new_amount - old_amount
-                            game_meta['players'][damage_dealer]['damage_dealt'] += new_amount - old_amount
-                            game_meta['players'][damage_receiver]['damage_received'] += new_amount - old_amount
+                            game_meta['players'][damage_dealer]['damage_dealt_by_tick'][game_time] += damage_amount
+                            game_meta['players'][damage_receiver]['damage_received_by_tick'][game_time] += damage_amount
+                            game_meta['players'][damage_dealer]['damage_to_player'][damage_receiver] += damage_amount
+                            game_meta['players'][damage_receiver]['damage_from_player'][damage_dealer] += damage_amount
+                            game_meta['players'][damage_dealer]['damage_dealt'] += damage_amount
+                            game_meta['players'][damage_receiver]['damage_received'] += damage_amount
                     else:
-                        events.append(f'{game_time}: {damage_dealer_name} damaged {damage_receiver_name} for {new_amount}')
-                        game_meta['players'][damage_dealer]['damage_dealt_by_tick'][game_time] += new_amount
-                        game_meta['players'][damage_receiver]['damage_received_by_tick'][game_time] += new_amount
-                        game_meta['players'][damage_dealer]['damage_to_player'][damage_receiver] += new_amount
-                        game_meta['players'][damage_receiver]['damage_from_player'][damage_dealer] += new_amount
-                        game_meta['players'][damage_dealer]['damage_dealt'] += new_amount
-                        game_meta['players'][damage_receiver]['damage_received'] += new_amount
+                        damage_amount = min(new_amount, max_damage)
+                        events.append(f'{game_time}: {damage_dealer_name} damaged {damage_receiver_name} for {damage_amount}')
+                        game_meta['players'][damage_dealer]['damage_dealt_by_tick'][game_time] += damage_amount
+                        game_meta['players'][damage_receiver]['damage_received_by_tick'][game_time] += damage_amount
+                        game_meta['players'][damage_dealer]['damage_to_player'][damage_receiver] += damage_amount
+                        game_meta['players'][damage_receiver]['damage_from_player'][damage_dealer] += damage_amount
+                        game_meta['players'][damage_dealer]['damage_dealt'] += damage_amount
+                        game_meta['players'][damage_receiver]['damage_received'] += damage_amount
             else:
                 for damage_receiver, new_amount in damage_receivers.items():
                     damage_receiver_name = new_game_info['players'][damage_receiver]['name']
-                    events.append(f'{game_time}: {damage_dealer_name} damaged {damage_receiver_name} for {new_amount}')
-                    game_meta['players'][damage_dealer]['damage_dealt_by_tick'][game_time] += new_amount
-                    game_meta['players'][damage_receiver]['damage_received_by_tick'][game_time] += new_amount
-                    game_meta['players'][damage_dealer]['damage_to_player'][damage_receiver] += new_amount
-                    game_meta['players'][damage_receiver]['damage_from_player'][damage_dealer] += new_amount
-                    game_meta['players'][damage_dealer]['damage_dealt'] += new_amount
-                    game_meta['players'][damage_receiver]['damage_received'] += new_amount
+                    max_damage = max(0.0, get_player_vitality(old_game_info['players'][damage_receiver]) - get_player_vitality(new_game_info['players'][damage_receiver]))
+                    damage_amount = min(new_amount, max_damage)
+                    events.append(f'{game_time}: {damage_dealer_name} damaged {damage_receiver_name} for {damage_amount}')
+                    game_meta['players'][damage_dealer]['damage_dealt_by_tick'][game_time] += damage_amount
+                    game_meta['players'][damage_receiver]['damage_received_by_tick'][game_time] += damage_amount
+                    game_meta['players'][damage_dealer]['damage_to_player'][damage_receiver] += damage_amount
+                    game_meta['players'][damage_receiver]['damage_from_player'][damage_dealer] += damage_amount
+                    game_meta['players'][damage_dealer]['damage_dealt'] += damage_amount
+                    game_meta['players'][damage_receiver]['damage_received'] += damage_amount
 
     # kills, deaths, assists, powerups
     if old_game_info['game_engine_running'] and new_game_info['game_engine_running']:
