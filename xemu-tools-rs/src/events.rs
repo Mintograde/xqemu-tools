@@ -264,6 +264,10 @@ impl GameMeta {
                     Some(_) => continue,
                     None => new_amount,
                 };
+                let max_damage = (player_vitality(old_game_info, damage_receiver)
+                    - player_vitality(new_game_info, damage_receiver))
+                .max(0.0);
+                let delta = delta.min(max_damage);
                 events.push(format!(
                     "{game_time}: {damage_dealer_name} damaged {damage_receiver_name} for {delta}"
                 ));
@@ -524,6 +528,19 @@ fn player_name(game_info: &Value, player_index: usize) -> String {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string()
+}
+
+fn player_vitality(game_info: &Value, player_index: usize) -> f64 {
+    game_info
+        .get("players")
+        .and_then(Value::as_array)
+        .and_then(|players| players.get(player_index))
+        .and_then(|player| player.get("player_object_data"))
+        .map(|data| {
+            number_field(data, "health") * number_field(data, "max_health")
+                + number_field(data, "shields") * number_field(data, "max_shields")
+        })
+        .unwrap_or(0.0)
 }
 
 fn projectile_ids(game_info: &Value) -> Vec<i64> {

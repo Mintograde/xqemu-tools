@@ -508,22 +508,33 @@ where
                 }
 
                 let live_status = build_live_status_message(&payload);
-                let live_status_game_id = live_status
+                let live_status_status = live_status.get("status").and_then(Value::as_str);
+                let live_status_is_terminal = matches!(
+                    live_status_status,
+                    Some("postgame" | "ended" | "stale")
+                );
+                let live_status_is_live = live_status_status == Some("live");
+                let live_status_source_external_id = live_status
                     .get("source_external_id")
                     .and_then(Value::as_str)
-                    .or_else(|| live_status.get("started_at").and_then(Value::as_str))
-                    .unwrap_or("__unknown__")
-                    .to_string();
+                    .filter(|value| !value.is_empty());
+                let live_status_game_id = match live_status_source_external_id {
+                    Some(source_external_id) => source_external_id.to_string(),
+                    None if live_status_is_terminal => last_live_status_game_id
+                        .clone()
+                        .unwrap_or_else(|| "__terminal__".to_string()),
+                    None => live_status
+                        .get("started_at")
+                        .and_then(Value::as_str)
+                        .unwrap_or("__unknown__")
+                        .to_string(),
+                };
                 if Some(live_status_game_id.clone()) != last_live_status_game_id {
                     terminal_status_sent_for_game_id = None;
                     last_live_status_game_id = Some(live_status_game_id.clone());
                     last_live_status_spawn_parameters_hash = None;
                 }
 
-                let live_status_is_terminal = matches!(
-                    live_status.get("status").and_then(Value::as_str),
-                    Some("postgame" | "ended" | "stale")
-                );
                 let live_status_spawn_parameters_hash = live_status
                     .get("spawn_parameters_hash")
                     .and_then(Value::as_str)
@@ -537,7 +548,7 @@ where
 
                 last_live_status = Some(live_status.clone());
                 if terminal_status_due
-                    || live_status_spawn_parameters_changed
+                    || (live_status_is_live && live_status_spawn_parameters_changed)
                     || (live_status_due && !live_status_is_terminal)
                 {
                     send_live_status(write, state.clone(), live_status).await?;
@@ -899,7 +910,7 @@ fn game_status(game_info: &Value) -> &'static str {
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        "waiting"
+        "postgame"
     } else {
         "stale"
     }
