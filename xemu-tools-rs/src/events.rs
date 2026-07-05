@@ -204,6 +204,8 @@ impl GameMeta {
             self.extract_spawn_events(old_game_info, new_game_info, &mut events, game_time);
         }
 
+        // FIXME: when game exits directly to main menu due to all players leaving the game, this
+        // doesn't count as ending game, and game_meta ends up with empty players at next game start.
         if old_can_score && !new_can_score {
             let map_name = string_field(new_game_info, "multiplayer_map_name");
             events.push(format!("{game_time}: Game ended on {map_name}"));

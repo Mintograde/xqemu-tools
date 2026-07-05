@@ -9,18 +9,17 @@ pub struct XemuProcess {
     pub pid: u32,
 }
 
+#[allow(dead_code)]
 pub fn wait_for_xemu() -> Result<XemuProcess> {
     loop {
         if let Some(process) = find_xemu_process() {
-            println!("xemu pid is {} ({:#x})", process.pid, process.pid);
             return Ok(process);
         }
-        println!("waiting 1 more seconds for xemu to start");
         thread::sleep(Duration::from_secs(1));
     }
 }
 
-fn find_xemu_process() -> Option<XemuProcess> {
+pub fn find_xemu_process() -> Option<XemuProcess> {
     let mut system = System::new_all();
     system.refresh_all();
 

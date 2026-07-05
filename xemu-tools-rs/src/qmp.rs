@@ -17,12 +17,10 @@ impl QmpClient {
         let host = host.into();
         let mut attempt = 0;
         loop {
-            println!("Trying to connect {attempt}");
             match Self::connect(&host, port) {
                 Ok(client) => return Ok(client),
-                Err(err) if attempt < 5 => {
+                Err(_) if attempt < 5 => {
                     attempt += 1;
-                    eprintln!("QMP connect failed: {err:#}");
                     thread::sleep(Duration::from_secs(1));
                 }
                 Err(err) => return Err(err),

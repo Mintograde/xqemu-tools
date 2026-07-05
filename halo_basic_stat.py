@@ -1976,6 +1976,7 @@ def get_game_info():
     object_header_datum_array_allocated_object_count = read_u16(object_header_datum_array + 0x2E)
     object_header_datum_array_element_count = read_u16(object_header_datum_array + 0x30)
     object_header_datum_array_first_element_address = read_u32(object_header_datum_array + 0x34)
+    network_game_client = get_network_game_client()
 
     # TODO: also check if this is a multiplayer game or campaign
     if game_time_initialized and game_time_active and not main_menu_is_active:
@@ -2198,7 +2199,7 @@ def get_game_info():
                     next_object=read_s32(dynamic_player_address + 0xC4),
                     next_object_2=hex(read_u32(dynamic_player_address + 0xC8)),  # used in find_aim_assist_targets_recursive(), seems to be object handle for next object in object table
                     # seems like normal path for players goes to biped_get_sight_position()
-                    parent_object=hex(read_s32(dynamic_player_address + 0xCC)),  # e.g. vehicle
+                    parent_object=read_u32(dynamic_player_address + 0xCC),  # e.g. vehicle
                     # unk_camera_0xB6=read_u8(dynamic_player_address + 0xB6),  # both of these are 0 for players, from unit_get_camera_position()
                     # unk_camera_0x64=read_s16(dynamic_player_address + 0x64),
 
@@ -2398,6 +2399,9 @@ def get_game_info():
                 # has_camo=player_stats['camo_timer'] > 0,
                 has_camo=bool(player_object_data) and player_object_data['camo'] == 0x51,
                 has_overshield=bool(player_object_data) and (player_object_data['shields_status'] == 0x10 or player_object_data['shields'] > 1),  # FIXME: replace int conversion
+                is_host=any(network_player['player_list_index'] == player_index and network_player['machine_index'] == 0 for network_player in network_game_client['network_game_data']['network_players']),
+                # vehicle_z=read_s32(object_header_datum_array_first_element_address + (player_object_data['parent_object'] & 0xFFFF) * object_header_datum_array_element_size + 8 + 0x14) if (bool(player_object_data) and player_object_data['parent_object'] != 0xFFFFFFFF) else 'N/A',
+                # is_hostman=bool(player_object_data) and player_object_data['parent_object'] != 0xFFFFFFFF and read_s32(object_header_datum_array_first_element_address + (player_object_data['parent_object'] & 0xFFFF) * object_header_datum_array_element_size + 8 + 0x14) >= 90.0
             )
             player_stats.update(derived_stats=derived_stats)
 
@@ -2447,7 +2451,7 @@ def get_game_info():
         game_time_info=get_game_time_info(),
         # game_variant=get_game_variant_global(),
         network_game_server=get_network_game_server(),
-        network_game_client=get_network_game_client(),
+        network_game_client=network_game_client,
         # game_update_data=dump_game_update_contents(),
         # fog_data=get_fog(),
         observer_cameras_address=f'{get_host_address(0x271550):#x}',
@@ -2688,6 +2692,7 @@ def handle_game_info_loop():
             items = game_info.pop('items', [])
             meta = game_info.pop('game_meta', [])
             gametype_settings = game_info.pop('gametype_settings', [])
+            network_game_client = game_info.pop('network_game_client', [])
             # objects = game_info.pop('objects', [])  # FIXME: just temporarily removing this for write performance
 
             # FIXME: PERF: storing game ticks like this uses lots of memory (~1-2MB/s)
@@ -2708,6 +2713,7 @@ def handle_game_info_loop():
                 ) if store_all_ticks else {},
                 game_meta=meta,
                 gametype_settings=gametype_settings,
+                network_game_client=network_game_client,
                 events=events,
                 spawns=spawns,
                 items=items,
@@ -3266,6 +3272,8 @@ def extract_events(old_game_info: dict, new_game_info: dict) -> list:
     #             player['derived_stats'][attribute] = meta[attribute]
 
     # game over
+    # FIXME: when game exits directly to main menu due to all players leaving the game, this doesn't count
+    #        as ending game, and game_meta ends up with empty players dict at start of next game
     if old_game_info['game_engine_can_score'] and not new_game_info['game_engine_can_score']:
         events.append(f'{game_time}: Game ended on {new_game_info["multiplayer_map_name"]}')
         game_meta['start_time'] = None

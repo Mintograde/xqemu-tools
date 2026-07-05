@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::runtime::{Health, SharedRuntime};
 use crate::util::timedelta_seconds_floor;
 use anyhow::{Context, Result};
 use chrono::NaiveDateTime;
@@ -9,16 +10,27 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 use std::thread;
+use std::time::Instant;
 use uuid::Uuid;
 
 pub fn start_replay_worker(
     config: Config,
     receiver: Receiver<Value>,
     relay_sender: Sender<Value>,
+    runtime: SharedRuntime,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        if let Err(err) = replay_worker(config, receiver, relay_sender) {
-            eprintln!("[replay] worker failed: {err:#}");
+        runtime.update(|status| {
+            status.replay.health = Health::Running;
+            status.replay.last_changed = Some(Instant::now());
+        });
+        if let Err(err) = replay_worker(config, receiver, relay_sender, runtime.clone()) {
+            runtime.update(|status| {
+                status.replay.health = Health::Error;
+                status.replay.last_error = Some(format!("{err:#}"));
+                status.replay.last_changed = Some(Instant::now());
+            });
+            runtime.log("replay", format!("worker failed: {err:#}"));
         }
     })
 }
@@ -27,15 +39,44 @@ fn replay_worker(
     config: Config,
     receiver: Receiver<Value>,
     relay_sender: Sender<Value>,
+    runtime: SharedRuntime,
 ) -> Result<()> {
     let mut game_ticks: Vec<Value> = Vec::new();
+    let mut first_tick: Option<Value> = None;
+    let mut last_tick: Option<Value> = None;
+    let mut ticks_recorded = 0u64;
+    let mut tick_buffer_complete = true;
     let mut events = Value::Array(Vec::new());
     let mut spawns = Value::Array(Vec::new());
     let mut items = Value::Array(Vec::new());
     let mut meta = Value::Array(Vec::new());
     let mut gametype_settings = Value::Array(Vec::new());
+    let mut network_game_client = Value::Array(Vec::new());
 
     while let Ok(mut game_info) = receiver.recv() {
+        if !runtime.controls.save_replays() {
+            if first_tick.is_some() {
+                runtime.log("replay", "discarded in-progress replay because saving is disabled");
+            }
+            reset_recording(
+                &mut game_ticks,
+                &mut first_tick,
+                &mut last_tick,
+                &mut ticks_recorded,
+                &mut tick_buffer_complete,
+            );
+            runtime.update(|status| {
+                status.replay.health = Health::Running;
+                status.replay.recording = false;
+                status.replay.queue_depth = receiver.len();
+                status.replay.current_game_id.clear();
+                status.replay.ticks_recorded = 0;
+                status.replay.ticks_buffered = 0;
+                status.replay.last_error = None;
+            });
+            continue;
+        }
+
         let game_id = game_info
             .get("game_id")
             .and_then(Value::as_str)
@@ -44,6 +85,10 @@ fn replay_worker(
         if game_id.is_empty() {
             continue;
         }
+        let ended = game_info
+            .get("game_ended_this_tick")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
         if let Some(map) = game_info.as_object_mut() {
             events = map.remove("events").unwrap_or_else(|| Value::Array(Vec::new()));
@@ -53,30 +98,61 @@ fn replay_worker(
             gametype_settings = map
                 .remove("gametype_settings")
                 .unwrap_or_else(|| Value::Array(Vec::new()));
+            network_game_client = map
+                .remove("network_game_client")
+                .unwrap_or_else(|| Value::Array(Vec::new()));
         }
 
-        game_ticks.push(game_info);
-        let Some(last_tick) = game_ticks.last() else {
+        if first_tick.is_none() {
+            first_tick = Some(game_info.clone());
+            tick_buffer_complete = runtime.controls.save_all_ticks();
+        }
+        last_tick = Some(game_info.clone());
+        ticks_recorded += 1;
+
+        if runtime.controls.save_all_ticks() && tick_buffer_complete {
+            game_ticks.push(game_info);
+        } else {
+            tick_buffer_complete = false;
+            game_ticks.clear();
+        }
+
+        runtime.update(|status| {
+            status.replay.health = Health::Running;
+            status.replay.recording = true;
+            status.replay.current_game_id = game_id.clone();
+            status.replay.ticks_recorded = ticks_recorded;
+            status.replay.ticks_buffered = game_ticks.len();
+            status.replay.queue_depth = receiver.len();
+            status.replay.last_error = None;
+        });
+
+        if !ended {
+            continue;
+        }
+
+        let Some(first_tick_ref) = first_tick.as_ref() else {
             continue;
         };
-        if !last_tick
-            .get("game_ended_this_tick")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
+        let Some(last_tick_ref) = last_tick.as_ref() else {
             continue;
-        }
-
-        let summary = build_summary(&game_id, &game_ticks);
-        println!("{}", serde_json::to_string_pretty(&summary)?);
+        };
+        let summary =
+            build_summary_from_parts(&game_id, first_tick_ref, last_tick_ref, ticks_recorded);
+        let ticks = if tick_buffer_complete {
+            Value::Array(std::mem::take(&mut game_ticks))
+        } else {
+            Value::Array(Vec::new())
+        };
         let game = json!({
             "summary": summary,
             "game_meta": meta,
             "gametype_settings": gametype_settings,
+            "network_game_client": network_game_client,
             "events": events,
             "spawns": spawns,
             "items": items,
-            "ticks": game_ticks,
+            "ticks": ticks,
         });
 
         fs::create_dir_all(&config.replay_directory)
@@ -85,21 +161,71 @@ fn replay_worker(
             .replay_directory
             .join(format!("{game_id}_final.json.zst"));
         let data_bytes = serde_json::to_vec(&game)?;
-        println!("Saving {} bytes to {}", data_bytes.len(), filename.display());
         let compressed = zstd::bulk::compress(&data_bytes, 11)?;
         fs::write(&filename, compressed)
             .with_context(|| format!("failed to write {}", filename.display()))?;
-        if config.ws_relay_enabled {
+        runtime.update(|status| {
+            status.replay.saved_replays += 1;
+            status.replay.last_saved_file = filename.display().to_string();
+            status.replay.last_save_bytes = data_bytes.len() as u64;
+            status.replay.last_changed = Some(Instant::now());
+        });
+        runtime.log(
+            "replay",
+            format!("saved {} bytes to {}", data_bytes.len(), filename.display()),
+        );
+        if config.ws_relay_enabled && runtime.controls.replay_uploads() {
             if let Err(err) = enqueue_replay_upload_request(&filename, &relay_sender) {
-                eprintln!(
-                    "[replay] failed to enqueue replay upload request for {}: {err:#}",
-                    safe_file_name(&filename)
+                runtime.update(|status| {
+                    status.replay.last_error = Some(format!("{err:#}"));
+                    status.replay.last_changed = Some(Instant::now());
+                });
+                runtime.log(
+                    "replay",
+                    format!(
+                        "failed to enqueue replay upload request for {}: {err:#}",
+                        safe_file_name(&filename)
+                    ),
                 );
+            } else {
+                runtime.update(|status| {
+                    status.replay.upload_requests += 1;
+                    status.replay.last_changed = Some(Instant::now());
+                });
             }
+        } else if config.ws_relay_enabled {
+            runtime.log("replay", "replay upload skipped because uploads are disabled");
         }
-        game_ticks = Vec::new();
+        reset_recording(
+            &mut game_ticks,
+            &mut first_tick,
+            &mut last_tick,
+            &mut ticks_recorded,
+            &mut tick_buffer_complete,
+        );
+        runtime.update(|status| {
+            status.replay.recording = false;
+            status.replay.current_game_id.clear();
+            status.replay.ticks_recorded = 0;
+            status.replay.ticks_buffered = 0;
+            status.replay.queue_depth = receiver.len();
+        });
     }
     Ok(())
+}
+
+fn reset_recording(
+    game_ticks: &mut Vec<Value>,
+    first_tick: &mut Option<Value>,
+    last_tick: &mut Option<Value>,
+    ticks_recorded: &mut u64,
+    tick_buffer_complete: &mut bool,
+) {
+    game_ticks.clear();
+    *first_tick = None;
+    *last_tick = None;
+    *ticks_recorded = 0;
+    *tick_buffer_complete = true;
 }
 
 fn enqueue_replay_upload_request(path: &Path, relay_sender: &Sender<Value>) -> Result<()> {
@@ -153,13 +279,16 @@ fn safe_file_name(path: &Path) -> String {
         .to_string()
 }
 
-fn build_summary(game_id: &str, game_ticks: &[Value]) -> Value {
-    let first = &game_ticks[0];
-    let last = game_ticks.last().unwrap();
+fn build_summary_from_parts(
+    game_id: &str,
+    first: &Value,
+    last: &Value,
+    ticks_recorded: u64,
+) -> Value {
     let first_tick = tick_number(first);
     let last_tick = tick_number(last);
     let ticks_elapsed = last_tick - first_tick + 1;
-    let ticks_recorded = game_ticks.len() as i64;
+    let ticks_recorded = ticks_recorded as i64;
     let mut summary = Map::new();
     summary.insert("game_id".to_string(), Value::String(game_id.to_string()));
     summary.insert("is_full_game".to_string(), Value::Bool(first_tick == 0));

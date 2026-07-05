@@ -12,6 +12,9 @@ pub struct Config {
     pub ws_relay_base_url: String,
     pub ws_relay_room: String,
     pub compute_spawn_parameters_hash: bool,
+    pub save_replays: bool,
+    pub save_all_ticks: bool,
+    pub replay_uploads_enabled: bool,
 }
 
 impl Default for Config {
@@ -35,6 +38,9 @@ impl Default for Config {
                 .unwrap_or_else(|_| "http://127.0.0.1:8787".to_string()),
             ws_relay_room: env::var("WS_RELAY_ROOM").unwrap_or_else(|_| "test-room2".to_string()),
             compute_spawn_parameters_hash: env_bool("COMPUTE_SPAWN_PARAMETERS_HASH", true),
+            save_replays: env_bool("ENABLE_REPLAY_SAVING", true),
+            save_all_ticks: env_bool("SAVE_ALL_TICKS", true),
+            replay_uploads_enabled: env_bool("ENABLE_REPLAY_UPLOADS", true),
         }
     }
 }

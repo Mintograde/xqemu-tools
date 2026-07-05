@@ -18,6 +18,12 @@ necessary_fields = dict(
     game_meta={},
     events={},
     gametype_settings={},
+    network_game_client=dict(
+        network_game_data=dict(
+            network_machines={},
+            network_players={},
+        )
+    ),
     spawns=dict(
         spawn_id={},
         x={},
@@ -112,6 +118,7 @@ necessary_fields_live.update(dict(
     spawns=necessary_fields['spawns'].copy(),
     items=necessary_fields['items'].copy(),
     gametype_settings=necessary_fields['gametype_settings'].copy(),
+    network_game_client=necessary_fields['network_game_client'].copy(),
 ))
 
 necessary_fields_dotted = [

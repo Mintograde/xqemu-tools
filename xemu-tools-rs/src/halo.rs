@@ -123,16 +123,11 @@ impl HaloReader {
 
         let new_game_in_progress = (game_time_initialized, game_time_active, game_time_paused);
         if self.last_game_in_progress != new_game_in_progress {
-            println!(
-                "game in progress changed to game_time_initialized={} game_time_active={} game_time_paused={}",
-                game_time_initialized, game_time_active, game_time_paused
-            );
             self.last_game_in_progress = new_game_in_progress;
         }
 
         let game_connection = self.mem.read_u16(self.globals.game_connection_address as u64)?;
         if self.last_game_connection != json!(game_connection) {
-            println!("game_connection changed to {}", py_hex_u32(game_connection as u32));
             self.last_game_connection = json!(game_connection);
         }
 
@@ -141,6 +136,7 @@ impl HaloReader {
             self.mem.read_u16(object_header_datum_array as u64 + 0x22)?;
         let object_header_datum_array_first_element_address =
             self.mem.read_u32(object_header_datum_array as u64 + 0x34)?;
+        let network_game_client = self.get_network_game_client()?;
 
         if game_time_initialized != 0 && game_time_active != 0 && main_menu_is_active == 0 {
             for player_index in 0..player_count {
@@ -360,11 +356,29 @@ impl HaloReader {
                             || object.get("shields").and_then(Value::as_f64).unwrap_or(0.0) > 1.0
                     })
                     .unwrap_or(false);
+                let is_host = network_game_client
+                    .get("network_game_data")
+                    .and_then(|data| data.get("network_players"))
+                    .and_then(Value::as_array)
+                    .map(|network_players| {
+                        network_players.iter().any(|network_player| {
+                            network_player
+                                .get("player_list_index")
+                                .and_then(Value::as_u64)
+                                == Some(player_index as u64)
+                                && network_player
+                                    .get("machine_index")
+                                    .and_then(Value::as_u64)
+                                    == Some(0)
+                        })
+                    })
+                    .unwrap_or(false);
                 player_stats.insert(
                     "derived_stats".to_string(),
                     json!({
                         "has_camo": has_camo,
                         "has_overshield": has_overshield,
+                        "is_host": is_host,
                     }),
                 );
 
@@ -426,7 +440,7 @@ impl HaloReader {
         );
         game_info.insert("game_time_info".to_string(), game_time_info);
         game_info.insert("network_game_server".to_string(), self.get_network_game_server()?);
-        game_info.insert("network_game_client".to_string(), self.get_network_game_client()?);
+        game_info.insert("network_game_client".to_string(), network_game_client);
         game_info.insert(
             "observer_cameras_address".to_string(),
             Value::String(format!("{:#x}", self.mem.get_host_address(0x271550)?)),
@@ -839,7 +853,7 @@ impl HaloReader {
         );
         map.insert(
             "parent_object".to_string(),
-            Value::String(py_hex_i32(self.mem.read_i32(dynamic_player_address + 0xCC)?)),
+            json!(self.mem.read_u32(dynamic_player_address + 0xCC)?),
         );
         insert_u8!("camo", 0x1B4);
         insert_u8!("flashlight", 0x1B6);
@@ -961,8 +975,7 @@ impl HaloReader {
         })();
         let (_game_globals_player_control_address, global_friction, global_adhesion) = match control_globals {
             Ok(values) => values,
-            Err(err) => {
-                eprintln!("Failed to read player control globals: {err:#}");
+            Err(_) => {
                 return Ok(Value::Object(Map::new()));
             }
         };

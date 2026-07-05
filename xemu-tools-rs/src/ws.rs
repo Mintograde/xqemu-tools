@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::runtime::{Health, RelayCommand, SharedRuntime};
 use crate::util::py_datetime_to_iso;
 use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::{Receiver, Sender};
@@ -16,6 +17,12 @@ use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
 
 const LIVE_STATUS_TICKS_PER_SECOND: f64 = 30.0;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RelayLoopExit {
+    Disconnected,
+    ReconnectRequested,
+}
+
 #[derive(Debug, Default)]
 struct RelayState {
     producer_key: Option<String>,
@@ -32,12 +39,21 @@ struct PendingReplayUpload {
     attempts: u8,
 }
 
-pub fn start_local_ws_server(config: Config, receiver: Receiver<Value>) -> thread::JoinHandle<()> {
+pub fn start_local_ws_server(
+    config: Config,
+    receiver: Receiver<Value>,
+    runtime: SharedRuntime,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-        runtime.block_on(async move {
-            if let Err(err) = run_local_ws_server(config, receiver).await {
-                eprintln!("[ws_server] failed: {err:#}");
+        let tokio_runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        tokio_runtime.block_on(async move {
+            if let Err(err) = run_local_ws_server(config, receiver, runtime.clone()).await {
+                runtime.update(|status| {
+                    status.local_ws.health = Health::Error;
+                    status.local_ws.last_error = Some(format!("{err:#}"));
+                    status.local_ws.last_changed = Some(Instant::now());
+                });
+                runtime.log("local_ws", format!("server failed: {err:#}"));
             }
         });
     })
@@ -47,40 +63,86 @@ pub fn start_relay_client(
     config: Config,
     receiver: Receiver<Value>,
     sender: Sender<Value>,
+    control_receiver: Receiver<RelayCommand>,
+    runtime: SharedRuntime,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-        runtime.block_on(async move {
-            if let Err(err) = run_relay_client(config, receiver, sender).await {
-                eprintln!("[ws_client] failed: {err:#}");
+        let tokio_runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        tokio_runtime.block_on(async move {
+            if let Err(err) =
+                run_relay_client(config, receiver, sender, control_receiver, runtime.clone()).await
+            {
+                runtime.update(|status| {
+                    status.relay.health = Health::Error;
+                    status.relay.last_error = Some(format!("{err:#}"));
+                    status.relay.last_changed = Some(Instant::now());
+                });
+                runtime.log("relay", format!("client failed: {err:#}"));
             }
         });
     })
 }
 
-async fn run_local_ws_server(config: Config, receiver: Receiver<Value>) -> Result<()> {
+async fn run_local_ws_server(
+    config: Config,
+    receiver: Receiver<Value>,
+    runtime: SharedRuntime,
+) -> Result<()> {
     let bind_addr = format!("{}:{}", config.websocket_host, config.websocket_port);
-    let listener = TcpListener::bind(&bind_addr)
-        .await
-        .with_context(|| format!("failed to bind websocket server on {bind_addr}"))?;
-    println!("Websocket server started {bind_addr}");
+    runtime.update(|status| {
+        status.local_ws.health = Health::Starting;
+        status.local_ws.bind_addr = bind_addr.clone();
+        status.local_ws.last_changed = Some(Instant::now());
+    });
+    let listener = match TcpListener::bind(&bind_addr).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            runtime.update(|status| {
+                status.local_ws.health = Health::Error;
+                status.local_ws.last_error = Some(format!("{err:#}"));
+                status.local_ws.last_changed = Some(Instant::now());
+            });
+            return Err(err).with_context(|| format!("failed to bind websocket server on {bind_addr}"));
+        }
+    };
+    runtime.update(|status| {
+        status.local_ws.health = Health::Running;
+        status.local_ws.last_error = None;
+        status.local_ws.last_changed = Some(Instant::now());
+    });
+    runtime.log("local_ws", format!("server started {bind_addr}"));
     let (tx, _) = broadcast::channel::<String>(64);
     let producer = tx.clone();
+    let producer_runtime = runtime.clone();
     thread::spawn(move || {
         while let Ok(value) = receiver.recv() {
             match serde_json::to_string(&value) {
                 Ok(message) => {
                     let _ = producer.send(message);
+                    producer_runtime.update(|status| {
+                        status.local_ws.messages_sent += 1;
+                    });
                 }
-                Err(err) => eprintln!("[ws_server] serialization failed: {err:#}"),
+                Err(err) => {
+                    producer_runtime.update(|status| {
+                        status.local_ws.last_error = Some(format!("{err:#}"));
+                        status.local_ws.last_changed = Some(Instant::now());
+                    });
+                    producer_runtime.log("local_ws", format!("serialization failed: {err:#}"));
+                }
             }
         }
     });
 
     loop {
         let (stream, address) = listener.accept().await?;
-        println!("Websocket client connected {address}");
+        runtime.update(|status| {
+            status.local_ws.client_count += 1;
+            status.local_ws.last_changed = Some(Instant::now());
+        });
+        runtime.log("local_ws", format!("client connected {address}"));
         let mut rx = tx.subscribe();
+        let client_runtime = runtime.clone();
         tokio::spawn(async move {
             match accept_async(stream).await {
                 Ok(mut ws) => {
@@ -90,9 +152,19 @@ async fn run_local_ws_server(config: Config, receiver: Receiver<Value>) -> Resul
                         }
                     }
                 }
-                Err(err) => eprintln!("[ws_server] accept failed: {err:#}"),
+                Err(err) => {
+                    client_runtime.update(|status| {
+                        status.local_ws.last_error = Some(format!("{err:#}"));
+                        status.local_ws.last_changed = Some(Instant::now());
+                    });
+                    client_runtime.log("local_ws", format!("accept failed: {err:#}"));
+                }
             }
-            println!("Websocket client disconnected {address}");
+            client_runtime.update(|status| {
+                status.local_ws.client_count = status.local_ws.client_count.saturating_sub(1);
+                status.local_ws.last_changed = Some(Instant::now());
+            });
+            client_runtime.log("local_ws", format!("client disconnected {address}"));
         });
     }
 }
@@ -101,18 +173,36 @@ async fn run_relay_client(
     config: Config,
     receiver: Receiver<Value>,
     sender: Sender<Value>,
+    control_receiver: Receiver<RelayCommand>,
+    runtime: SharedRuntime,
 ) -> Result<()> {
     let uri = relay_uri(&config);
+    runtime.update(|status| {
+        status.relay.health = Health::Starting;
+        status.relay.uri = uri.clone();
+        status.relay.last_changed = Some(Instant::now());
+    });
     let state = Arc::new(Mutex::new(RelayState {
         max_replay_upload_retries: 2,
         ..RelayState::default()
     }));
 
     loop {
-        println!("[ws_client][info] Attempting to connect to {uri}...");
+        runtime.update(|status| {
+            status.relay.health = Health::Starting;
+            status.relay.attempts += 1;
+            status.relay.last_changed = Some(Instant::now());
+        });
+        runtime.log("relay", format!("connecting to {uri}"));
+        let mut reconnect_requested = false;
         match connect_async(&uri).await {
             Ok((ws, _response)) => {
-                println!("[ws_client][info] Connection established.");
+                runtime.update(|status| {
+                    status.relay.health = Health::Connected;
+                    status.relay.last_error = None;
+                    status.relay.last_changed = Some(Instant::now());
+                });
+                runtime.log("relay", "connection established");
                 let (mut write, mut read) = ws.split();
                 let (outbound_control_tx, outbound_control_rx) = mpsc::unbounded_channel::<Value>();
                 if let Some(Ok(raw)) = read.next().await {
@@ -126,19 +216,21 @@ async fn run_relay_client(
                                 .map(ToOwned::to_owned);
                             let expires_at = welcome.get("expiresAt").cloned().unwrap_or(Value::Null);
                             state.lock().unwrap().producer_key = producer_key.clone();
-                            println!(
-                                "[ws_client][info] Welcome: producer key received expiresAt={expires_at}"
+                            runtime.log(
+                                "relay",
+                                format!("producer key received expiresAt={expires_at}"),
                             );
                         } else {
-                            println!("[ws_client][warn] Unexpected welcome message: {welcome}");
+                            runtime.log("relay", format!("unexpected welcome message: {welcome}"));
                         }
                     } else {
-                        println!("[ws_client][warn] Unexpected first message: {raw:?}");
+                        runtime.log("relay", format!("unexpected first message: {raw:?}"));
                     }
                 }
 
                 let recv_state = state.clone();
                 let recv_control_tx = outbound_control_tx.clone();
+                let recv_runtime = runtime.clone();
                 let recv_task = tokio::spawn(async move {
                     while let Some(message) = read.next().await {
                         match message {
@@ -148,12 +240,17 @@ async fn run_relay_client(
                                         value,
                                         recv_state.clone(),
                                         recv_control_tx.clone(),
+                                        recv_runtime.clone(),
                                     )
                                     .await;
                                 }
                             }
                             Err(err) => {
-                                println!("[ws_client][recv] Error: {err:#}");
+                                recv_runtime.update(|status| {
+                                    status.relay.last_error = Some(format!("{err:#}"));
+                                    status.relay.last_changed = Some(Instant::now());
+                                });
+                                recv_runtime.log("relay", format!("receive error: {err:#}"));
                                 break;
                             }
                         }
@@ -165,30 +262,72 @@ async fn run_relay_client(
                     state.clone(),
                     &receiver,
                     outbound_control_rx,
+                    &control_receiver,
+                    runtime.clone(),
                 )
                 .await;
                 recv_task.abort();
-                if let Err(err) = send_result {
-                    println!("[ws_client][send] {err:#}");
+                match send_result {
+                    Ok(RelayLoopExit::ReconnectRequested) => {
+                        reconnect_requested = true;
+                        runtime.update(|status| {
+                            status.relay.health = Health::Disconnected;
+                            status.relay.reconnects += 1;
+                            status.relay.last_changed = Some(Instant::now());
+                        });
+                        runtime.log("relay", "manual reconnect starting");
+                    }
+                    Ok(RelayLoopExit::Disconnected) => {
+                        runtime.update(|status| {
+                            status.relay.health = Health::Disconnected;
+                            status.relay.last_changed = Some(Instant::now());
+                        });
+                        runtime.log("relay", "sender loop disconnected");
+                    }
+                    Err(err) => {
+                        runtime.update(|status| {
+                            status.relay.health = Health::Error;
+                            status.relay.last_error = Some(format!("{err:#}"));
+                            status.relay.last_changed = Some(Instant::now());
+                        });
+                        runtime.log("relay", format!("send error: {err:#}"));
+                    }
                 }
             }
             Err(err) => {
-                println!("[ws_client][error] Connection failed: {err}. Retrying in 5 seconds...");
+                runtime.update(|status| {
+                    status.relay.health = Health::Error;
+                    status.relay.last_error = Some(err.to_string());
+                    status.relay.last_changed = Some(Instant::now());
+                });
+                runtime.log("relay", format!("connection failed: {err}; retrying"));
             }
         }
 
         let (dropped, retained_upload_request_ids) = flush_stale_relay_messages(&receiver, &sender);
         if dropped > 0 {
-            println!("[ws_client][warn] Disconnected: Flushed {dropped} stale messages from queue.");
+            runtime.update(|status| {
+                status.relay.dropped_stale_messages += dropped as u64;
+            });
+            runtime.log("relay", format!("flushed {dropped} stale relay messages"));
         }
         let requeued =
             requeue_pending_replay_uploads(&state, &sender, &retained_upload_request_ids);
         if requeued > 0 {
-            println!(
-                "[ws_client][warn] Disconnected: Requeued {requeued} pending replay upload requests."
+            runtime.log(
+                "relay",
+                format!("requeued {requeued} pending replay upload requests"),
             );
         }
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        runtime.update(|status| {
+            status.relay.pending_uploads = state.lock().unwrap().replay_uploads.len();
+        });
+        tokio::time::sleep(if reconnect_requested {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_secs(5)
+        })
+        .await;
     }
 }
 
@@ -196,12 +335,14 @@ async fn handle_relay_message(
     value: Value,
     state: Arc<Mutex<RelayState>>,
     outbound_control_tx: mpsc::UnboundedSender<Value>,
+    runtime: SharedRuntime,
 ) {
     match value.get("type").and_then(Value::as_str) {
         Some("error") if value.get("code").and_then(Value::as_str) == Some("BAD_KEY") => {
             state.lock().unwrap().require_key = true;
-            println!(
-                "[ws_client][info] Server requires per-message key. Will include it in subsequent messages."
+            runtime.log(
+                "relay",
+                "server requires per-message key; including key in subsequent messages",
             );
         }
         Some("replay_upload_presign_response") => {
@@ -210,27 +351,41 @@ async fn handle_relay_message(
                 .and_then(Value::as_str)
                 .unwrap_or("<missing>")
                 .to_string();
-            println!("[ws_client][recv] replay upload presign response request_id={request_id}");
-            if let Err(err) =
-                handle_replay_upload_presign_response(value, state, outbound_control_tx).await
+            runtime.log(
+                "relay",
+                format!("replay upload presign response request_id={request_id}"),
+            );
+            if let Err(err) = handle_replay_upload_presign_response(
+                value,
+                state,
+                outbound_control_tx,
+                runtime.clone(),
+            )
+            .await
             {
-                println!(
-                    "[ws_client][upload] presign response handling failed request_id={request_id}: {err:#}"
+                runtime.log(
+                    "relay",
+                    format!(
+                        "presign response handling failed request_id={request_id}: {err:#}"
+                    ),
                 );
             }
         }
         Some("replay_upload_presign_error") => {
-            println!(
-                "[ws_client][recv] replay upload presign error request_id={} status={} error={}",
-                value
-                    .get("request_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("<missing>"),
-                value.get("status").and_then(Value::as_str).unwrap_or("<missing>"),
-                value.get("error").and_then(Value::as_str).unwrap_or("<missing>")
+            runtime.log(
+                "relay",
+                format!(
+                    "replay upload presign error request_id={} status={} error={}",
+                    value
+                        .get("request_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<missing>"),
+                    value.get("status").and_then(Value::as_str).unwrap_or("<missing>"),
+                    value.get("error").and_then(Value::as_str).unwrap_or("<missing>")
+                ),
             );
         }
-        _ => println!("[ws_client][recv] {value}"),
+        _ => runtime.log("relay", format!("recv {}", compact_json(&value, 180))),
     }
 }
 
@@ -238,6 +393,7 @@ async fn handle_replay_upload_presign_response(
     msg: Value,
     state: Arc<Mutex<RelayState>>,
     outbound_control_tx: mpsc::UnboundedSender<Value>,
+    runtime: SharedRuntime,
 ) -> Result<()> {
     let request_id = msg
         .get("request_id")
@@ -253,7 +409,10 @@ async fn handle_replay_upload_presign_response(
             .cloned()
     };
     let Some(pending) = pending else {
-        println!("[ws_client][upload] no local replay path for request_id={request_id}");
+        runtime.log(
+            "relay",
+            format!("no local replay path for request_id={request_id}"),
+        );
         return Ok(());
     };
     let presigned_request = msg
@@ -277,7 +436,13 @@ async fn handle_replay_upload_presign_response(
                 }))
                 .map_err(|_| anyhow!("relay control channel closed"))?;
             state.lock().unwrap().replay_uploads.remove(&request_id);
-            println!("[ws_client][upload] replay uploaded request_id={request_id} status={status}");
+            runtime.update(|app_status| {
+                app_status.relay.pending_uploads = state.lock().unwrap().replay_uploads.len();
+            });
+            runtime.log(
+                "relay",
+                format!("replay uploaded request_id={request_id} status={status}"),
+            );
         }
         Err(err) => {
             let retry = {
@@ -303,16 +468,23 @@ async fn handle_replay_upload_presign_response(
 
             if let Some((payload, attempts)) = retry {
                 let delay_secs = (1u64 << attempts.min(5)).min(30);
-                println!(
-                    "[ws_client][upload] replay upload failed request_id={request_id}: {err:#}; retrying in {delay_secs}s"
+                runtime.log(
+                    "relay",
+                    format!(
+                        "replay upload failed request_id={request_id}: {err:#}; retrying in {delay_secs}s"
+                    ),
                 );
                 tokio::time::sleep(Duration::from_secs(delay_secs)).await;
                 outbound_control_tx
                     .send(payload)
                     .map_err(|_| anyhow!("relay control channel closed"))?;
             } else {
-                println!(
-                    "[ws_client][upload] replay upload failed request_id={request_id}: {err:#}; giving up"
+                runtime.update(|app_status| {
+                    app_status.relay.pending_uploads = state.lock().unwrap().replay_uploads.len();
+                });
+                runtime.log(
+                    "relay",
+                    format!("replay upload failed request_id={request_id}: {err:#}; giving up"),
                 );
             }
         }
@@ -363,6 +535,7 @@ async fn send_replay_upload_presign_request<W>(
     write: &mut W,
     state: Arc<Mutex<RelayState>>,
     mut payload: Value,
+    runtime: SharedRuntime,
 ) -> Result<()>
 where
     W: SinkExt<Message> + Unpin,
@@ -398,18 +571,23 @@ where
                 attempts: 0,
             },
         );
+        runtime.update(|status| {
+            status.relay.pending_uploads = state.lock().unwrap().replay_uploads.len();
+        });
     } else if !already_tracked {
-        println!(
-            "[ws_client][upload] replay upload request missing local path or request_id; sending without local upload tracking"
+        runtime.log(
+            "relay",
+            "replay upload request missing local path or request_id; sending without tracking",
         );
     }
-    send_control_message(write, state, payload).await
+    send_control_message(write, state, payload, runtime).await
 }
 
 async fn send_control_message<W>(
     write: &mut W,
     state: Arc<Mutex<RelayState>>,
     mut payload: Value,
+    runtime: SharedRuntime,
 ) -> Result<()>
 where
     W: SinkExt<Message> + Unpin,
@@ -419,6 +597,9 @@ where
     write
         .send(Message::Text(serde_json::to_string(&payload)?.into()))
         .await?;
+    runtime.update(|status| {
+        status.relay.messages_sent += 1;
+    });
     Ok(())
 }
 
@@ -483,12 +664,14 @@ async fn send_relay_loop<W>(
     state: Arc<Mutex<RelayState>>,
     receiver: &Receiver<Value>,
     mut outbound_control_rx: mpsc::UnboundedReceiver<Value>,
-) -> Result<()>
+    control_receiver: &Receiver<RelayCommand>,
+    runtime: SharedRuntime,
+) -> Result<RelayLoopExit>
 where
     W: SinkExt<Message> + Unpin,
     <W as futures_util::Sink<Message>>::Error: std::error::Error + Send + Sync + 'static,
 {
-    println!("[ws_client] Sender loop started.");
+    runtime.log("relay", "sender loop started");
     let mut last_live_status: Option<Value> = None;
     let mut last_live_status_sent_at = Instant::now() - Duration::from_secs(60);
     let mut last_live_status_game_id: Option<String> = None;
@@ -496,14 +679,31 @@ where
     let mut terminal_status_sent_for_game_id: Option<String> = None;
 
     loop {
+        if matches!(
+            control_receiver.try_recv(),
+            Ok(RelayCommand::ReconnectNow)
+        ) {
+            return Ok(RelayLoopExit::ReconnectRequested);
+        }
+
         while let Ok(payload) = outbound_control_rx.try_recv() {
-            send_control_message(write, state.clone(), payload).await?;
+            send_control_message(write, state.clone(), payload, runtime.clone()).await?;
         }
 
         match receiver.try_recv() {
             Ok(payload) => {
                 if is_replay_upload_presign_request(&payload) {
-                    send_replay_upload_presign_request(write, state.clone(), payload).await?;
+                    if runtime.controls.replay_uploads() {
+                        send_replay_upload_presign_request(
+                            write,
+                            state.clone(),
+                            payload,
+                            runtime.clone(),
+                        )
+                        .await?;
+                    } else {
+                        runtime.log("relay", "replay upload request skipped; uploads disabled");
+                    }
                     continue;
                 }
 
@@ -551,7 +751,7 @@ where
                     || (live_status_is_live && live_status_spawn_parameters_changed)
                     || (live_status_due && !live_status_is_terminal)
                 {
-                    send_live_status(write, state.clone(), live_status).await?;
+                    send_live_status(write, state.clone(), live_status, runtime.clone()).await?;
                     last_live_status_sent_at = Instant::now();
                     if live_status_spawn_parameters_hash.is_some() {
                         last_live_status_spawn_parameters_hash = live_status_spawn_parameters_hash;
@@ -566,6 +766,10 @@ where
                 let message_bytes = serde_json::to_vec(&payload)?;
                 let compressed = zstd::bulk::compress(&message_bytes, 12)?;
                 write.send(Message::Binary(compressed.into())).await?;
+                runtime.update(|status| {
+                    status.relay.messages_sent += 1;
+                    status.relay.compressed_ticks_sent += 1;
+                });
             }
             Err(crossbeam_channel::TryRecvError::Empty) => {
                 if let Some(live_status) = &last_live_status {
@@ -573,7 +777,13 @@ where
                     if !matches!(status, Some("postgame" | "ended" | "stale"))
                         && last_live_status_sent_at.elapsed() >= Duration::from_secs(10)
                     {
-                        send_live_status(write, state.clone(), live_status.clone()).await?;
+                        send_live_status(
+                            write,
+                            state.clone(),
+                            live_status.clone(),
+                            runtime.clone(),
+                        )
+                        .await?;
                         last_live_status_sent_at = Instant::now();
                         last_live_status_spawn_parameters_hash = live_status
                             .get("spawn_parameters_hash")
@@ -583,17 +793,19 @@ where
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                runtime.log("relay", "sender channel disconnected");
+                return Ok(RelayLoopExit::Disconnected);
+            }
         }
     }
-    println!("[ws_client] Sender loop finished.");
-    Ok(())
 }
 
 async fn send_live_status<W>(
     write: &mut W,
     state: Arc<Mutex<RelayState>>,
     mut live_status: Value,
+    runtime: SharedRuntime,
 ) -> Result<()>
 where
     W: SinkExt<Message> + Unpin,
@@ -602,10 +814,10 @@ where
     if let Some(map) = live_status.as_object_mut() {
         map.insert("observed_at".to_string(), Value::String(utc_now_python_iso()));
     }
-    add_key_if_needed(&mut live_status, &state.lock().unwrap());
-    write
-        .send(Message::Text(serde_json::to_string(&live_status)?.into()))
-        .await?;
+    send_control_message(write, state, live_status, runtime.clone()).await?;
+    runtime.update(|status| {
+        status.relay.live_status_sent += 1;
+    });
     Ok(())
 }
 
@@ -627,6 +839,15 @@ fn message_to_json(message: &Message) -> Result<Value> {
         Message::Binary(bytes) => Ok(serde_json::from_slice(bytes)?),
         _ => Ok(Value::Null),
     }
+}
+
+fn compact_json(value: &Value, max_len: usize) -> String {
+    let mut text = value.to_string();
+    if text.len() > max_len {
+        text.truncate(max_len.saturating_sub(3));
+        text.push_str("...");
+    }
+    text
 }
 
 fn add_key_if_needed(payload: &mut Value, state: &RelayState) {
@@ -666,6 +887,7 @@ fn strip_tick(data: &Value) -> Value {
     copy_spawns(&mut root, data);
     copy_field(&mut root, data, "items");
     copy_field(&mut root, data, "gametype_settings");
+    copy_network_game_client(&mut root, data);
     Value::Object(root)
 }
 
@@ -805,6 +1027,27 @@ fn copy_spawns(root: &mut Map<String, Value>, data: &Value) {
     root.insert("spawns".to_string(), Value::Array(stripped));
 }
 
+fn copy_network_game_client(root: &mut Map<String, Value>, data: &Value) {
+    let Some(client) = data.get("network_game_client").and_then(Value::as_object) else {
+        return;
+    };
+
+    let mut client_map = Map::new();
+    if let Some(network_game_data) = client.get("network_game_data").and_then(Value::as_object) {
+        let mut network_game_data_map = Map::new();
+        for field in ["network_machines", "network_players"] {
+            if let Some(value) = network_game_data.get(field) {
+                network_game_data_map.insert(field.to_string(), value.clone());
+            }
+        }
+        client_map.insert(
+            "network_game_data".to_string(),
+            Value::Object(network_game_data_map),
+        );
+    }
+    root.insert("network_game_client".to_string(), Value::Object(client_map));
+}
+
 fn copy_into(target: &mut Map<String, Value>, source: &Value, field: &str) {
     if let Some(value) = source.get(field) {
         target.insert(field.to_string(), value.clone());
@@ -936,6 +1179,7 @@ fn player_summary(game_info: &Value) -> Value {
                 "respawn_timer": player.get("respawn_timer").cloned().unwrap_or(Value::Null),
                 "has_camo": derived_stats.and_then(|stats| stats.get("has_camo")).and_then(Value::as_bool).unwrap_or(false),
                 "has_overshield": derived_stats.and_then(|stats| stats.get("has_overshield")).and_then(Value::as_bool).unwrap_or(false),
+                "is_host": derived_stats.and_then(|stats| stats.get("is_host")).and_then(Value::as_bool).unwrap_or(false),
                 "damage_dealt": player_index.map(|index| player_damage(game_info, index, "damage_dealt")).unwrap_or(Value::from(0)),
                 "damage_received": player_index.map(|index| player_damage(game_info, index, "damage_received")).unwrap_or(Value::from(0)),
             }));
