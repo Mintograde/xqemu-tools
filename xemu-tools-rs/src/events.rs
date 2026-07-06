@@ -28,6 +28,10 @@ pub struct PlayerMeta {
     overshield_by_tick: BTreeMap<String, i64>,
     overshield_count: i64,
     active_projectiles: Vec<Value>,
+    multikills_by_tick: BTreeMap<String, Vec<i64>>,
+    multikill_counts_by_amount: BTreeMap<String, i64>,
+    streak_by_tick: BTreeMap<String, i64>,
+    streak_counts_by_amount: BTreeMap<String, i64>,
 }
 
 pub struct ExtractResult {
@@ -316,6 +320,37 @@ impl GameMeta {
                 *meta.kills_by_tick.entry(game_time_key.to_string()).or_default() += kills - old_kills;
             }
 
+            let kill_streak = int_field(new_player, "kill_streak");
+            let old_kill_streak = int_field(old_player, "kill_streak");
+            if kill_streak > old_kill_streak {
+                meta.streak_by_tick.insert(game_time_key.to_string(), kill_streak);
+                *meta.streak_counts_by_amount.entry(kill_streak.to_string()).or_default() += 1;
+            }
+
+            let multikill = int_field(new_player, "multikill");
+            let old_multikill = int_field(old_player, "multikill");
+            let time_of_last_kill = int_field(new_player, "time_of_last_kill");
+            let old_time_of_last_kill = int_field(old_player, "time_of_last_kill");
+            if multikill > 1
+                && (multikill > old_multikill || time_of_last_kill > old_time_of_last_kill)
+            {
+                let multikill_amounts = if multikill > old_multikill {
+                    ((old_multikill + 1).max(2)..=multikill).collect::<Vec<_>>()
+                } else {
+                    vec![multikill]
+                };
+                for multikill_amount in multikill_amounts {
+                    meta.multikills_by_tick
+                        .entry(game_time_key.to_string())
+                        .or_default()
+                        .push(multikill_amount);
+                    *meta
+                        .multikill_counts_by_amount
+                        .entry(multikill_amount.to_string())
+                        .or_default() += 1;
+                }
+            }
+
             let deaths = int_field(new_player, "deaths");
             let old_deaths = int_field(old_player, "deaths");
             if deaths > old_deaths {
@@ -473,6 +508,19 @@ impl PlayerMeta {
             "active_projectiles".to_string(),
             Value::Array(self.active_projectiles.clone()),
         );
+        map.insert(
+            "multikills_by_tick".to_string(),
+            i64_vec_map_to_value(&self.multikills_by_tick),
+        );
+        map.insert(
+            "multikill_counts_by_amount".to_string(),
+            i64_map_to_value(&self.multikill_counts_by_amount),
+        );
+        map.insert("streak_by_tick".to_string(), i64_map_to_value(&self.streak_by_tick));
+        map.insert(
+            "streak_counts_by_amount".to_string(),
+            i64_map_to_value(&self.streak_counts_by_amount),
+        );
         Value::Object(map)
     }
 }
@@ -481,6 +529,14 @@ fn i64_map_to_value(input: &BTreeMap<String, i64>) -> Value {
     let mut map = Map::new();
     for (key, value) in input {
         map.insert(key.clone(), json!(*value));
+    }
+    Value::Object(map)
+}
+
+fn i64_vec_map_to_value(input: &BTreeMap<String, Vec<i64>>) -> Value {
+    let mut map = Map::new();
+    for (key, value) in input {
+        map.insert(key.clone(), json!(value));
     }
     Value::Object(map)
 }

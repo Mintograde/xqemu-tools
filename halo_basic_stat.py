@@ -2193,8 +2193,8 @@ def get_game_info():
                     shields_charge_delay=read_u16(dynamic_player_address + 0xB4),  # from object_damage_update()
 
                     # 0x4096 when shields are charging, 0x4112 when overshield charging
-                    shields_status=read_u16(dynamic_player_address + 0xB6),  # 0x0 normally, 0x10 while overshield charging, 0x1000 while shields charging, 0x8 while shields are fully depleted
-                    shields_status_hex=hex(read_u16(dynamic_player_address + 0xB6)),
+                    some_misc_flags=read_u16(dynamic_player_address + 0xB6),  # 0x0 normally, 0x10 while overshield charging, 0x1000 while shields charging, 0x8 while shields are fully depleted
+                    some_misc_flags_hex=hex(read_u16(dynamic_player_address + 0xB6)),
 
                     next_object=read_s32(dynamic_player_address + 0xC4),
                     next_object_2=hex(read_u32(dynamic_player_address + 0xC8)),  # used in find_aim_assist_targets_recursive(), seems to be object handle for next object in object table
@@ -2395,13 +2395,15 @@ def get_game_info():
                 model_nodes=model_nodes,  # also includes dead body while respawning
             )
 
+            vehicle_z_out_of_bounds = bool(player_object_data) and player_object_data['parent_object'] != 0xFFFFFFFF and bool(read_float(read_u32(object_header_datum_array_first_element_address + (player_object_data['parent_object'] & 0xFFFF) * object_header_datum_array_element_size + 8) + 0x14) >= 90)
+            invulnerable_bit = bool(player_object_data) and bool(player_object_data['some_misc_flags'] & (1 << 11))
+
             derived_stats = dict(
                 # has_camo=player_stats['camo_timer'] > 0,
                 has_camo=bool(player_object_data) and player_object_data['camo'] == 0x51,
-                has_overshield=bool(player_object_data) and (player_object_data['shields_status'] == 0x10 or player_object_data['shields'] > 1),  # FIXME: replace int conversion
+                has_overshield=bool(player_object_data) and (player_object_data['some_misc_flags'] == 0x10 or player_object_data['shields'] > 1),  # FIXME: replace int conversion
                 is_host=any(network_player['player_list_index'] == player_index and network_player['machine_index'] == 0 for network_player in network_game_client['network_game_data']['network_players']),
-                # vehicle_z=read_s32(object_header_datum_array_first_element_address + (player_object_data['parent_object'] & 0xFFFF) * object_header_datum_array_element_size + 8 + 0x14) if (bool(player_object_data) and player_object_data['parent_object'] != 0xFFFFFFFF) else 'N/A',
-                # is_hostman=bool(player_object_data) and player_object_data['parent_object'] != 0xFFFFFFFF and read_s32(object_header_datum_array_first_element_address + (player_object_data['parent_object'] & 0xFFFF) * object_header_datum_array_element_size + 8 + 0x14) >= 90.0
+                is_hostman=vehicle_z_out_of_bounds or invulnerable_bit,
             )
             player_stats.update(derived_stats=derived_stats)
 
@@ -2994,7 +2996,11 @@ def get_empty_player_meta():
             camo_count=0,
             overshield_by_tick=defaultdict(int),
             overshield_count=0,
-            active_projectiles=[]
+            active_projectiles=[],
+            multikills_by_tick=defaultdict(list),
+            multikill_counts_by_amount=defaultdict(int),
+            streak_by_tick=defaultdict(int),
+            streak_counts_by_amount=defaultdict(int),
         )
 
 
@@ -3180,6 +3186,14 @@ def extract_events(old_game_info: dict, new_game_info: dict) -> list:
                 if (kills := new_player['kills']) > old_player['kills']:
                     events.append(f'{game_time}: {new_player["name"]} got a kill ({kills})')
                     game_meta['players'][new_player['player_index']]['kills_by_tick'][game_time] += kills - old_player['kills']
+                if (kill_streak := new_player['kill_streak']) > old_player['kill_streak']:
+                    game_meta['players'][new_player['player_index']]['streak_by_tick'][game_time] = kill_streak
+                    game_meta['players'][new_player['player_index']]['streak_counts_by_amount'][kill_streak] += 1
+                if (multikill := new_player['multikill']) > 1 and (multikill > old_player['multikill'] or new_player['time_of_last_kill'] > old_player['time_of_last_kill']):
+                    multikill_amounts = range(max(2, old_player['multikill'] + 1), multikill + 1) if multikill > old_player['multikill'] else [multikill]
+                    for multikill_amount in multikill_amounts:
+                        game_meta['players'][new_player['player_index']]['multikills_by_tick'][game_time].append(multikill_amount)
+                        game_meta['players'][new_player['player_index']]['multikill_counts_by_amount'][multikill_amount] += 1
                 if (deaths := new_player['deaths']) > old_player['deaths']:
                     events.append(f'{game_time}: {new_player["name"]} died ({deaths})')
                     game_meta['players'][new_player['player_index']]['deaths_by_tick'][game_time] += deaths - old_player['deaths']

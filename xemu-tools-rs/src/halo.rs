@@ -352,7 +352,7 @@ impl HaloReader {
                 let has_overshield = player_object_data
                     .as_object()
                     .map(|object| {
-                        object.get("shields_status").and_then(Value::as_u64) == Some(0x10)
+                        object.get("some_misc_flags").and_then(Value::as_u64) == Some(0x10)
                             || object.get("shields").and_then(Value::as_f64).unwrap_or(0.0) > 1.0
                     })
                     .unwrap_or(false);
@@ -373,12 +373,42 @@ impl HaloReader {
                         })
                     })
                     .unwrap_or(false);
+                let vehicle_z_out_of_bounds = if let Some(object) = player_object_data.as_object() {
+                    let parent_object = object
+                        .get("parent_object")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0xFFFF_FFFF);
+                    if parent_object != 0xFFFF_FFFF {
+                        let parent_object_address = self.mem.read_u32(
+                            object_header_datum_array_first_element_address as u64
+                                + (parent_object & 0xFFFF)
+                                    * object_header_datum_array_element_size as u64
+                                + 8,
+                        )?;
+                        self.mem.read_f32(parent_object_address as u64 + 0x14)? >= 90.0
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                let invulnerable_bit = player_object_data
+                    .as_object()
+                    .map(|object| {
+                        object
+                            .get("some_misc_flags")
+                            .and_then(Value::as_u64)
+                            .map(|value| value & (1 << 11) != 0)
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
                 player_stats.insert(
                     "derived_stats".to_string(),
                     json!({
                         "has_camo": has_camo,
                         "has_overshield": has_overshield,
                         "is_host": is_host,
+                        "is_hostman": vehicle_z_out_of_bounds || invulnerable_bit,
                     }),
                 );
 
@@ -843,9 +873,12 @@ impl HaloReader {
         insert_i32!("unk3", 0xAC);
         insert_i32!("unk4", 0xB0);
         insert_u16!("shields_charge_delay", 0xB4);
-        let shields_status = self.mem.read_u16(dynamic_player_address + 0xB6)?;
-        map.insert("shields_status".to_string(), json!(shields_status));
-        map.insert("shields_status_hex".to_string(), Value::String(py_hex_u32(shields_status as u32)));
+        let some_misc_flags = self.mem.read_u16(dynamic_player_address + 0xB6)?;
+        map.insert("some_misc_flags".to_string(), json!(some_misc_flags));
+        map.insert(
+            "some_misc_flags_hex".to_string(),
+            Value::String(py_hex_u32(some_misc_flags as u32)),
+        );
         insert_i32!("next_object", 0xC4);
         map.insert(
             "next_object_2".to_string(),
