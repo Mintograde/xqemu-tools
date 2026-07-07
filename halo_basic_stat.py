@@ -2605,6 +2605,10 @@ def send_to_api(filename):
     #     print(f"send_to_api: error while uploading {filename}: {e}")
 
 
+def json_bytes(data):
+    return json.dumps(data, default=str).encode()
+
+
 def send_to_file(data, outfile, compression=''):
     
     # TODO: better serialization of datetime
@@ -2612,7 +2616,7 @@ def send_to_file(data, outfile, compression=''):
     os.makedirs(os.path.dirname(outfile), exist_ok=True)
     if compression:
         # TODO: also generate versioned schema
-        data_bytes = json.dumps(data, default=str).encode()
+        data_bytes = json_bytes(data)
         print(f'Saving {len(data_bytes)} bytes to {outfile}')
         if compression == 'gz':
             with gzip.open(outfile, 'wb') as f:
@@ -2637,6 +2641,75 @@ def send_to_file(data, outfile, compression=''):
             print(f'Saving uncompressed to {outfile}')
             json.dump(data, f, default=str)
             f.write('\n')
+
+
+def start_replay_tick_spool(game_id):
+    os.makedirs(REPLAY_DIRECTORY, exist_ok=True)
+    filename = os.path.join(REPLAY_DIRECTORY, f'.{game_id}_{uuid.uuid4()}.ticks.json.zst.tmp')
+    f = open(filename, 'wb')
+    writer = zstd.ZstdCompressor(level=1).stream_writer(f, closefd=False)
+    return dict(filename=filename, file=f, writer=writer, ticks=0, bytes=0, closed=False)
+
+
+def write_replay_tick_spool(spool, game_info):
+    data = json_bytes(game_info)
+    if spool['ticks']:
+        spool['writer'].write(b', ')
+        spool['bytes'] += 2
+    spool['writer'].write(data)
+    spool['ticks'] += 1
+    spool['bytes'] += len(data)
+
+
+def close_replay_tick_spool(spool):
+    if spool and not spool['closed']:
+        try:
+            spool['writer'].close()
+        finally:
+            spool['file'].close()
+            spool['closed'] = True
+
+
+def discard_replay_tick_spool(spool):
+    if spool:
+        try:
+            close_replay_tick_spool(spool)
+        finally:
+            try:
+                os.remove(spool['filename'])
+            except OSError:
+                pass
+
+
+def send_to_file_from_replay_tick_spool(data, spool, outfile, compression=''):
+    if compression != 'zstd':
+        raise ValueError('replay tick spooling only supports zstd output')
+    keys = ('summary', 'game_meta', 'gametype_settings', 'network_game_client', 'events', 'spawns', 'items')
+    fields = [(json.dumps(key).encode(), json_bytes(data[key])) for key in keys]
+    content_size = 1 + sum((2 if i else 0) + len(k) + 2 + len(v) for i, (k, v) in enumerate(fields)) + len(b', "ticks": [') + spool['bytes'] + 2
+    print(f'Saving {content_size} streamed bytes to {outfile}')
+    os.makedirs(os.path.dirname(outfile), exist_ok=True)
+    close_replay_tick_spool(spool)
+    try:
+        with open(outfile, 'wb') as f:
+            writer = zstd.ZstdCompressor(level=11).stream_writer(f, size=content_size, closefd=False)
+            writer.write(b'{')
+            for i, (key, value) in enumerate(fields):
+                if i:
+                    writer.write(b', ')
+                writer.write(key)
+                writer.write(b': ')
+                writer.write(value)
+            writer.write(b', "ticks": [')
+            with open(spool['filename'], 'rb') as tick_file:
+                reader = zstd.ZstdDecompressor().stream_reader(tick_file)
+                for chunk in iter(lambda: reader.read(1024 * 1024), b''):
+                    writer.write(chunk)
+                reader.close()
+            writer.write(b']}')
+            writer.close()
+    finally:
+        discard_replay_tick_spool(spool)
 
 
 def send_to_database(game_info, db):
@@ -2675,8 +2748,13 @@ def handle_game_info_loop():
     #     print('WARNING: database is not up -- run `vagrant up` to start a local database')
 
     game_ticks = []
+    first_game_tick = None
+    last_game_tick = None
+    ticks_recorded = 0
+    tick_spool = None
     events = []
     store_all_ticks = True
+    stream_ticks_to_disk = REPLAY_COMPRESSION == 'zstd'
 
     # FIXME: try/catch for common or potential exceptions here -- need to keep this thread alive or restart if it dies
 
@@ -2708,20 +2786,29 @@ def handle_game_info_loop():
 
             # FIXME: PERF: storing game ticks like this uses lots of memory (~1-2MB/s)
             if store_all_ticks:
-                game_ticks.append(game_info)
+                if first_game_tick is None:
+                    first_game_tick = game_info
+                    if stream_ticks_to_disk:
+                        tick_spool = start_replay_tick_spool(game_id)
+                last_game_tick = game_info
+                ticks_recorded += 1
+                if stream_ticks_to_disk:
+                    write_replay_tick_spool(tick_spool, game_info)
+                else:
+                    game_ticks.append(game_info)
             # FIXME: this doesn't handle game crashes or missing the last tick of the game (or probably some other similar cases)
             game = dict(
                 summary=dict(
                     game_id=game_id,
                     generated_by='xqemu-tools',
-                    is_full_game=game_ticks[0]['game_time_info']['game_time'] == 0,
-                    recording_started=game_ticks[0]['current_time'],
-                    recording_ended=game_ticks[-1]['current_time'],
-                    game_duration_ingame=str(datetime.timedelta(seconds=game_ticks[-1]['game_time_info']['game_time']/30)).split('.')[0],
-                    recording_duration=str(game_ticks[-1]['current_time'] - game_ticks[0]['current_time']).split('.')[0],
-                    ticks_elapsed=game_ticks[-1]['game_time_info']['game_time'] - game_ticks[0]['game_time_info']['game_time'] + 1,
-                    ticks_recorded=len(game_ticks),
-                    ticks_dropped=game_ticks[-1]['game_time_info']['game_time'] - game_ticks[0]['game_time_info']['game_time'] + 1 - len(game_ticks),
+                    is_full_game=first_game_tick['game_time_info']['game_time'] == 0,
+                    recording_started=first_game_tick['current_time'],
+                    recording_ended=last_game_tick['current_time'],
+                    game_duration_ingame=str(datetime.timedelta(seconds=last_game_tick['game_time_info']['game_time']/30)).split('.')[0],
+                    recording_duration=str(last_game_tick['current_time'] - first_game_tick['current_time']).split('.')[0],
+                    ticks_elapsed=last_game_tick['game_time_info']['game_time'] - first_game_tick['game_time_info']['game_time'] + 1,
+                    ticks_recorded=ticks_recorded,
+                    ticks_dropped=last_game_tick['game_time_info']['game_time'] - first_game_tick['game_time_info']['game_time'] + 1 - ticks_recorded,
                 ) if store_all_ticks else {},
                 game_meta=meta,
                 gametype_settings=gametype_settings,
@@ -2729,7 +2816,7 @@ def handle_game_info_loop():
                 events=events,
                 spawns=spawns,
                 items=items,
-                ticks=game_ticks,
+                ticks=[] if stream_ticks_to_disk else game_ticks,
             )
 
             if game_info['game_ended_this_tick']:
@@ -2737,11 +2824,18 @@ def handle_game_info_loop():
                 if store_all_ticks:
                     # TODO: do this in a separate process, or async -- need to resume tick capture as soon as we can
                     filename = os.path.join(REPLAY_DIRECTORY, f'{game_id}_final.json.zst')
-                    send_to_file(game, filename, compression=REPLAY_COMPRESSION)
+                    if stream_ticks_to_disk:
+                        send_to_file_from_replay_tick_spool(game, tick_spool, filename, compression=REPLAY_COMPRESSION)
+                        tick_spool = None
+                    else:
+                        send_to_file(game, filename, compression=REPLAY_COMPRESSION)
                     send_to_api(filename)
                     # send_to_file(game, f'{REPLAY_DIRECTORY}/{game_id}_final.json.br', compression='br')
                     # send_to_file(game, f'{REPLAY_DIRECTORY}/{game_id}_final.json.gz', compression='gz')
                     game_ticks = []
+                    first_game_tick = None
+                    last_game_tick = None
+                    ticks_recorded = 0
                 gc.collect()
             # send_to_file(game_info, f'{REPLAY_DIRECTORY}/{game_id}.jsonl')
             # send_to_file(game_info, f'C:/tmp/replays/{game_id}.jsonl')
