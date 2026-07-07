@@ -11,6 +11,8 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 
+const EXCLUDE_SCENERY_OBJECTS: bool = true;
+
 #[derive(Debug, Clone)]
 struct HaloGlobals {
     player_datum_array: u32,
@@ -212,6 +214,12 @@ impl HaloReader {
                 } else {
                     dynamic_player_address as u64 + 0x3E0
                 };
+                if damage_table_address == 0x3E0 {
+                    println!(
+                        "WARNING: skipping player {player_index} -- no dynamic player object, and previous has no damage table"
+                    );
+                    continue;
+                }
                 player_object_debug.insert(
                     "damage_table_address".to_string(),
                     Value::String(format!(
@@ -1579,6 +1587,9 @@ impl HaloReader {
             let tag_name = self.mem.read_string(tag_name_ptr as u64, 128)?;
             let object_type = self.mem.read_u8(object_address_u64 + 0x64)?;
             let object_type_string = self.object_string_from_type(object_type)?;
+            if EXCLUDE_SCENERY_OBJECTS && object_type_string == "scenery" {
+                continue;
+            }
             let mut object = Map::new();
             object.insert("object_id".to_string(), json!(i));
             object.insert(
@@ -1683,6 +1694,7 @@ impl HaloReader {
         let mut indexes_by_type: BTreeMap<String, Vec<Value>> = BTreeMap::new();
         let mut ids_by_type: BTreeMap<String, Vec<Value>> = BTreeMap::new();
         let mut projectiles_by_unit_id: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+        ids_by_type.insert("projectile".to_string(), Vec::new());
         for (index, object) in objects.iter().enumerate() {
             let object_type = object
                 .get("object_type_string")

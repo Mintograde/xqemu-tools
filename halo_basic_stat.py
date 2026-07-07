@@ -59,6 +59,7 @@ ENABLE_UI = True
 ENABLE_API_CLIENT = False
 ENABLE_WEBSOCKET_RELAY = True
 COMPUTE_SPAWN_PARAMETERS_HASH = True
+EXCLUDE_SCENERY_OBJECTS = True
 
 
 def get_pid():
@@ -786,9 +787,9 @@ something_saying_main_menu = read_u32(0x2E4000 + 4)
 spawns_cache = []
 
 
-def get_spawns(cache_results=True):
+def get_spawns(cache_results=True, invalidate_cache=False):
 
-    if cache_results and spawns_cache:
+    if cache_results and spawns_cache and not invalidate_cache:
         return spawns_cache
 
     global_scenario_address = read_u32(0x39BE5C)
@@ -830,11 +831,11 @@ def get_spawns(cache_results=True):
 items_cache = []
 
 
-def get_items(cache_results=True):
+def get_items(cache_results=True, invalidate_cache=False):
 
     # TODO: detect when a new map is loaded (pregame) and preload all its items, to avoid qmp lookups on first tick
 
-    if cache_results and items_cache:
+    if cache_results and items_cache and not invalidate_cache:
         return items_cache
 
     # print('====================')
@@ -1021,6 +1022,8 @@ def get_objects():
             tag_name = read_string(read_u32(32 * read_s16(object_address) + global_tag_instances_address + 0x10))
             object_type = read_u8(object_address + 0x64)
             object_type_string = object_string_from_type(object_type)
+            if EXCLUDE_SCENERY_OBJECTS and object_type_string == 'scenery':
+                continue
             objects.append(dict(
                 object_id=i,
                 address=f'{hex(object_address)} -> {hex(known_addresses[object_address]["host_address"])}',
@@ -2027,6 +2030,12 @@ def get_game_info():
                         previous_player_object_handle & 0xFFFF) * object_header_datum_array_element_size + 8) + 0x3E0
             else:
                 damage_table_address = dynamic_player_address + 0x3E0
+
+            # FIXME: hostman has no damage table in postgame? working around this by skipping the whole player until I look at this closer
+            if damage_table_address == 0x3E0:
+                print(f'WARNING: skipping player {player_index} -- no dynamic player object, and previous has no damage table')
+                continue
+
             player_object_debug['damage_table_address'] = f'{hex(damage_table_address)} -> {hex(get_host_address(damage_table_address))}'
             damage_table = []
             for i in range(4):
@@ -2704,6 +2713,7 @@ def handle_game_info_loop():
             game = dict(
                 summary=dict(
                     game_id=game_id,
+                    generated_by='xqemu-tools',
                     is_full_game=game_ticks[0]['game_time_info']['game_time'] == 0,
                     recording_started=game_ticks[0]['current_time'],
                     recording_ended=game_ticks[-1]['current_time'],
@@ -3055,7 +3065,11 @@ def extract_events(old_game_info: dict, new_game_info: dict) -> list:
         events.append(f'{game_time}: New game started on {new_game_info["multiplayer_map_name"]}')
         game_meta['start_time'] = new_game_info['current_time']
         initialize_meta_players(new_game_info)
-        clear_caches()
+
+        # FIXME: naively clearing cache here without replacing was causing first tick to skip player spawn events,
+        #        but ideally we wouldn't need to call get_spawns() and get_items() twice on the first tick
+        new_game_info['spawns'] = get_spawns(invalidate_cache=True)
+        new_game_info['items_cache'] = get_items(invalidate_cache=True)
 
     # projectiles
     # TODO: new projectiles this tick
@@ -3241,7 +3255,7 @@ def extract_events(old_game_info: dict, new_game_info: dict) -> list:
                                               else [None for _ in new_game_info['players']], # old_game_info has no players on first tick
                                           new_game_info['players']):
             # if player has just spawned
-            if not old_player or (not old_player['player_object_data'] and new_player['player_object_data']):
+            if (not old_game_info['game_engine_can_score'] or not old_player or not old_player['player_object_data']) and new_player['player_object_data']:
                 player_x, player_y, player_z = (new_player['player_object_data']['x'], new_player['player_object_data']['y'], new_player['player_object_data']['z'])
                 spawn_found = False
                 for spawn in new_game_info['spawns']:
@@ -3500,11 +3514,15 @@ def main_loop():
                 if WS_RELAY_ENABLED:
                     ws_client_queue.put(game_info)
 
-                if (game_time > last_status_sent + API_UPDATE_INTERVAL_SECONDS and game_info['game_engine_can_score']) or game_info['game_ended_this_tick']:
-                    api_client_queue.put(get_summary(game_info))
-                    last_status_sent = game_time
-                elif game_time < last_status_sent:
-                    last_status_sent = 0
+                if ENABLE_API_CLIENT:
+                    if (game_time > last_status_sent + API_UPDATE_INTERVAL_SECONDS and game_info['game_engine_can_score']) or game_info['game_ended_this_tick']:
+                        try:
+                            api_client_queue.put(get_summary(game_info))
+                        except Exception as e:
+                            print(f'WARNING: failed to send summary to API client: {e}')
+                        last_status_sent = game_time
+                    elif game_time < last_status_sent:
+                        last_status_sent = 0
 
                 # analyze_offset_map()
 

@@ -65,11 +65,3 @@ pub fn as_f64(value: &Value) -> Option<f64> {
         .or_else(|| value.as_i64().map(|v| v as f64))
         .or_else(|| value.as_u64().map(|v| v as f64))
 }
-
-pub fn json_number_from_f64_or_i64(value: f64) -> Value {
-    if value.fract() == 0.0 && value >= i64::MIN as f64 && value <= i64::MAX as f64 {
-        Value::Number(Number::from(value as i64))
-    } else {
-        f64_value(value)
-    }
-}

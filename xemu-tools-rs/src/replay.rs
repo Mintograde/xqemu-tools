@@ -291,6 +291,10 @@ fn build_summary_from_parts(
     let ticks_recorded = ticks_recorded as i64;
     let mut summary = Map::new();
     summary.insert("game_id".to_string(), Value::String(game_id.to_string()));
+    summary.insert(
+        "generated_by".to_string(),
+        Value::String("xemu-tools-rs".to_string()),
+    );
     summary.insert("is_full_game".to_string(), Value::Bool(first_tick == 0));
     summary.insert(
         "recording_started".to_string(),

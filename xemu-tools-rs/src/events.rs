@@ -1,4 +1,4 @@
-use crate::util::{as_f64, as_i64, get_path, json_number_from_f64_or_i64};
+use crate::util::{as_f64, as_i64, f64_value, get_path};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 
@@ -274,8 +274,9 @@ impl GameMeta {
                     - player_vitality(new_game_info, damage_receiver))
                 .max(0.0);
                 let delta = delta.min(max_damage);
+                let damage_amount = format_damage_amount(delta);
                 events.push(format!(
-                    "{game_time}: {damage_dealer_name} damaged {damage_receiver_name} for {delta}"
+                    "{game_time}: {damage_dealer_name} damaged {damage_receiver_name} for {damage_amount}"
                 ));
                 let dealer_meta = self.players.entry(damage_dealer).or_default();
                 add_f64(&mut dealer_meta.damage_dealt_by_tick, game_time_key, delta);
@@ -487,7 +488,7 @@ impl PlayerMeta {
         );
         map.insert(
             "damage_dealt".to_string(),
-            json_number_from_f64_or_i64(self.damage_dealt),
+            f64_value(self.damage_dealt),
         );
         map.insert(
             "damage_received_by_tick".to_string(),
@@ -495,7 +496,7 @@ impl PlayerMeta {
         );
         map.insert(
             "damage_received".to_string(),
-            json_number_from_f64_or_i64(self.damage_received),
+            f64_value(self.damage_received),
         );
         map.insert("camo_by_tick".to_string(), i64_map_to_value(&self.camo_by_tick));
         map.insert("camo_count".to_string(), json!(self.camo_count));
@@ -544,9 +545,17 @@ fn i64_vec_map_to_value(input: &BTreeMap<String, Vec<i64>>) -> Value {
 fn f64_map_to_value(input: &BTreeMap<String, f64>) -> Value {
     let mut map = Map::new();
     for (key, value) in input {
-        map.insert(key.clone(), json_number_from_f64_or_i64(*value));
+        map.insert(key.clone(), f64_value(*value));
     }
     Value::Object(map)
+}
+
+fn format_damage_amount(value: f64) -> String {
+    if value.is_finite() && value.fract() == 0.0 {
+        format!("{value:.1}")
+    } else {
+        format!("{value}")
+    }
 }
 
 fn add_f64(map: &mut BTreeMap<String, f64>, key: &str, amount: f64) {
