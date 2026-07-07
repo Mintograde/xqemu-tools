@@ -204,3 +204,4 @@ fabric.properties
 
 replays/
 screenshots/
+xemu-tools-rs/config.toml

@@ -9,7 +9,6 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 crossbeam-channel = "0.5"
 crossterm = "0.28"
-dotenvy = "0.15"
 futures-util = "0.3"
 indexmap = { version = "2", features = ["serde"] }
 ratatui = "0.29"
@@ -21,6 +20,7 @@ sha2 = "0.10"
 sysinfo = "0.36"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
+toml = "0.8"
 urlencoding = "2"
 uuid = { version = "1", features = ["v4"] }
 windows-sys = { version = "0.59", features = [

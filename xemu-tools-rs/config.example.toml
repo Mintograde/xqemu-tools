@@ -1,0 +1,23 @@
+# Copy this file to config.toml and adjust as needed.
+
+[websocket]
+host = "localhost"
+port = 9000
+
+[qmp]
+host = "localhost"
+port = 4445
+
+[replay]
+directory = "./replays"
+save = true
+save_all_ticks = true
+uploads = true
+
+[relay]
+enabled = true
+base_url = "wss://halospawns-live-relay-dev.mintograde.workers.dev"
+room = "test-room"
+
+[features]
+compute_spawn_parameters_hash = true

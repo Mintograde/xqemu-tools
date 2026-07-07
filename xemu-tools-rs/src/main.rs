@@ -27,9 +27,7 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
 
 fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let _ = dotenvy::from_filename("xemu-tools-rs.env");
-    let _ = dotenvy::dotenv();
-    let config = Config::default();
+    let config = Config::load()?;
     let runtime = RuntimeState::new(config.clone());
     let (command_tx, command_rx) = unbounded();
     let _tui = tui::start_tui(runtime.clone(), command_tx);
