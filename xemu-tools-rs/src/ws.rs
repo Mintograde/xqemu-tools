@@ -1,11 +1,14 @@
 use crate::config::Config;
-use crate::runtime::{Health, RelayCommand, SharedRuntime};
+use crate::runtime::{
+    Health, LocalWsClientStatus, PipelineEdge, RelayCommand, ReplayUploadStatus, SharedRuntime,
+    UploadPhase,
+};
 use crate::util::py_datetime_to_iso;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::{Receiver, Sender};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -102,7 +105,8 @@ async fn run_local_ws_server(
                 status.local_ws.last_error = Some(format!("{err:#}"));
                 status.local_ws.last_changed = Some(Instant::now());
             });
-            return Err(err).with_context(|| format!("failed to bind websocket server on {bind_addr}"));
+            return Err(err)
+                .with_context(|| format!("failed to bind websocket server on {bind_addr}"));
         }
     };
     runtime.update(|status| {
@@ -116,8 +120,11 @@ async fn run_local_ws_server(
     let producer_runtime = runtime.clone();
     thread::spawn(move || {
         while let Ok(value) = receiver.recv() {
+            producer_runtime.record_pipeline_dequeue(PipelineEdge::LocalWebSocket, receiver.len());
             match serde_json::to_string(&value) {
                 Ok(message) => {
+                    producer_runtime
+                        .record_pipeline_bytes(PipelineEdge::LocalWebSocket, message.len() as u64);
                     let _ = producer.send(message);
                     producer_runtime.update(|status| {
                         status.local_ws.messages_sent += 1;
@@ -136,22 +143,80 @@ async fn run_local_ws_server(
 
     loop {
         let (stream, address) = listener.accept().await?;
+        let address_key = address.to_string();
         runtime.update(|status| {
             status.local_ws.client_count += 1;
+            status.local_ws.clients.push(LocalWsClientStatus {
+                address: address_key.clone(),
+                connected_at: Instant::now(),
+                last_sent_at: None,
+                messages_sent: 0,
+                bytes_sent: 0,
+                lagged_messages: 0,
+            });
             status.local_ws.last_changed = Some(Instant::now());
         });
         runtime.log("local_ws", format!("client connected {address}"));
         let mut rx = tx.subscribe();
         let client_runtime = runtime.clone();
         tokio::spawn(async move {
+            let mut messages_sent = 0u64;
+            let mut bytes_sent = 0u64;
+            let mut last_reported_at = Instant::now();
+            let mut control_interval = tokio::time::interval(Duration::from_millis(250));
             match accept_async(stream).await {
-                Ok(mut ws) => {
-                    while let Ok(message) = rx.recv().await {
-                        if ws.send(Message::Text(message.into())).await.is_err() {
+                Ok(mut ws) => loop {
+                    let received = tokio::select! {
+                        _ = control_interval.tick() => {
+                            if client_runtime.take_client_disconnect_request(&address_key) {
+                                client_runtime.log(
+                                    "local_ws",
+                                    format!("disconnecting client {address_key} by request"),
+                                );
+                                break;
+                            }
+                            continue;
+                        }
+                        received = rx.recv() => received,
+                    };
+                    match received {
+                        Ok(message) => {
+                            let message_bytes = message.len() as u64;
+                            if ws.send(Message::Text(message.into())).await.is_err() {
+                                break;
+                            }
+                            messages_sent += 1;
+                            bytes_sent += message_bytes;
+                            if last_reported_at.elapsed() >= Duration::from_secs(1) {
+                                update_local_client(
+                                    &client_runtime,
+                                    &address_key,
+                                    messages_sent,
+                                    bytes_sent,
+                                    0,
+                                );
+                                last_reported_at = Instant::now();
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            client_runtime
+                                .record_pipeline_drop(PipelineEdge::LocalWebSocket, skipped);
+                            update_local_client(
+                                &client_runtime,
+                                &address_key,
+                                messages_sent,
+                                bytes_sent,
+                                skipped,
+                            );
+                            client_runtime.log(
+                                "local_ws",
+                                format!("client {address} lagged by {skipped} messages"),
+                            );
                             break;
                         }
+                        Err(broadcast::error::RecvError::Closed) => break,
                     }
-                }
+                },
                 Err(err) => {
                     client_runtime.update(|status| {
                         status.local_ws.last_error = Some(format!("{err:#}"));
@@ -161,12 +226,38 @@ async fn run_local_ws_server(
                 }
             }
             client_runtime.update(|status| {
-                status.local_ws.client_count = status.local_ws.client_count.saturating_sub(1);
+                status
+                    .local_ws
+                    .clients
+                    .retain(|client| client.address != address_key);
+                status.local_ws.client_count = status.local_ws.clients.len();
                 status.local_ws.last_changed = Some(Instant::now());
             });
             client_runtime.log("local_ws", format!("client disconnected {address}"));
         });
     }
+}
+
+fn update_local_client(
+    runtime: &SharedRuntime,
+    address: &str,
+    messages_sent: u64,
+    bytes_sent: u64,
+    lagged_messages: u64,
+) {
+    runtime.update(|status| {
+        if let Some(client) = status
+            .local_ws
+            .clients
+            .iter_mut()
+            .find(|client| client.address == address)
+        {
+            client.messages_sent = messages_sent;
+            client.bytes_sent = bytes_sent;
+            client.lagged_messages += lagged_messages;
+            client.last_sent_at = Some(Instant::now());
+        }
+    });
 }
 
 async fn run_relay_client(
@@ -191,6 +282,8 @@ async fn run_relay_client(
         runtime.update(|status| {
             status.relay.health = Health::Starting;
             status.relay.attempts += 1;
+            status.relay.producer_key_present = false;
+            status.relay.next_reconnect_at = None;
             status.relay.last_changed = Some(Instant::now());
         });
         runtime.log("relay", format!("connecting to {uri}"));
@@ -200,6 +293,8 @@ async fn run_relay_client(
                 runtime.update(|status| {
                     status.relay.health = Health::Connected;
                     status.relay.last_error = None;
+                    status.relay.reconnect_backoff_secs = 0;
+                    status.relay.next_reconnect_at = None;
                     status.relay.last_changed = Some(Instant::now());
                 });
                 runtime.log("relay", "connection established");
@@ -214,8 +309,15 @@ async fn run_relay_client(
                                 .get("producerKey")
                                 .and_then(Value::as_str)
                                 .map(ToOwned::to_owned);
-                            let expires_at = welcome.get("expiresAt").cloned().unwrap_or(Value::Null);
+                            let expires_at =
+                                welcome.get("expiresAt").cloned().unwrap_or(Value::Null);
                             state.lock().unwrap().producer_key = producer_key.clone();
+                            runtime.update(|status| {
+                                status.relay.producer_key_present = producer_key.is_some();
+                                status.relay.producer_key_expires_at = expires_at.to_string();
+                                status.relay.last_received_at = Some(Instant::now());
+                                status.relay.messages_received += 1;
+                            });
                             runtime.log(
                                 "relay",
                                 format!("producer key received expiresAt={expires_at}"),
@@ -304,7 +406,8 @@ async fn run_relay_client(
             }
         }
 
-        let (dropped, retained_upload_request_ids) = flush_stale_relay_messages(&receiver, &sender);
+        let (dropped, retained_upload_request_ids) =
+            flush_stale_relay_messages(&receiver, &sender, &runtime);
         if dropped > 0 {
             runtime.update(|status| {
                 status.relay.dropped_stale_messages += dropped as u64;
@@ -312,22 +415,24 @@ async fn run_relay_client(
             runtime.log("relay", format!("flushed {dropped} stale relay messages"));
         }
         let requeued =
-            requeue_pending_replay_uploads(&state, &sender, &retained_upload_request_ids);
+            requeue_pending_replay_uploads(&state, &sender, &retained_upload_request_ids, &runtime);
         if requeued > 0 {
             runtime.log(
                 "relay",
                 format!("requeued {requeued} pending replay upload requests"),
             );
         }
-        runtime.update(|status| {
-            status.relay.pending_uploads = state.lock().unwrap().replay_uploads.len();
-        });
-        tokio::time::sleep(if reconnect_requested {
+        let retry_delay = if reconnect_requested {
             Duration::from_millis(100)
         } else {
             Duration::from_secs(5)
-        })
-        .await;
+        };
+        runtime.update(|status| {
+            status.relay.pending_uploads = state.lock().unwrap().replay_uploads.len();
+            status.relay.reconnect_backoff_secs = retry_delay.as_secs();
+            status.relay.next_reconnect_at = Some(Instant::now() + retry_delay);
+        });
+        tokio::time::sleep(retry_delay).await;
     }
 }
 
@@ -337,9 +442,14 @@ async fn handle_relay_message(
     outbound_control_tx: mpsc::UnboundedSender<Value>,
     runtime: SharedRuntime,
 ) {
+    runtime.update(|status| {
+        status.relay.messages_received += 1;
+        status.relay.last_received_at = Some(Instant::now());
+    });
     match value.get("type").and_then(Value::as_str) {
         Some("error") if value.get("code").and_then(Value::as_str) == Some("BAD_KEY") => {
             state.lock().unwrap().require_key = true;
+            runtime.update(|status| status.relay.require_key = true);
             runtime.log(
                 "relay",
                 "server requires per-message key; including key in subsequent messages",
@@ -365,13 +475,27 @@ async fn handle_relay_message(
             {
                 runtime.log(
                     "relay",
-                    format!(
-                        "presign response handling failed request_id={request_id}: {err:#}"
-                    ),
+                    format!("presign response handling failed request_id={request_id}: {err:#}"),
                 );
             }
         }
         Some("replay_upload_presign_error") => {
+            let request_id = value
+                .get("request_id")
+                .and_then(Value::as_str)
+                .unwrap_or("<missing>");
+            update_upload_status(
+                &runtime,
+                request_id,
+                None,
+                None,
+                UploadPhase::Failed,
+                None,
+                value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("presign request failed"),
+            );
             runtime.log(
                 "relay",
                 format!(
@@ -380,8 +504,14 @@ async fn handle_relay_message(
                         .get("request_id")
                         .and_then(Value::as_str)
                         .unwrap_or("<missing>"),
-                    value.get("status").and_then(Value::as_str).unwrap_or("<missing>"),
-                    value.get("error").and_then(Value::as_str).unwrap_or("<missing>")
+                    value
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<missing>"),
+                    value
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<missing>")
                 ),
             );
         }
@@ -415,6 +545,15 @@ async fn handle_replay_upload_presign_response(
         );
         return Ok(());
     };
+    update_upload_status(
+        &runtime,
+        &request_id,
+        None,
+        None,
+        UploadPhase::Uploading,
+        Some(pending.attempts),
+        "uploading replay bytes",
+    );
     let presigned_request = msg
         .get("presigned_request")
         .cloned()
@@ -439,6 +578,15 @@ async fn handle_replay_upload_presign_response(
             runtime.update(|app_status| {
                 app_status.relay.pending_uploads = state.lock().unwrap().replay_uploads.len();
             });
+            update_upload_status(
+                &runtime,
+                &request_id,
+                None,
+                None,
+                UploadPhase::Uploaded,
+                Some(pending.attempts),
+                format!("HTTP {status}"),
+            );
             runtime.log(
                 "relay",
                 format!("replay uploaded request_id={request_id} status={status}"),
@@ -468,6 +616,15 @@ async fn handle_replay_upload_presign_response(
 
             if let Some((payload, attempts)) = retry {
                 let delay_secs = (1u64 << attempts.min(5)).min(30);
+                update_upload_status(
+                    &runtime,
+                    &request_id,
+                    None,
+                    None,
+                    UploadPhase::Retrying,
+                    Some(attempts),
+                    format!("retrying in {delay_secs}s: {err:#}"),
+                );
                 runtime.log(
                     "relay",
                     format!(
@@ -482,6 +639,15 @@ async fn handle_replay_upload_presign_response(
                 runtime.update(|app_status| {
                     app_status.relay.pending_uploads = state.lock().unwrap().replay_uploads.len();
                 });
+                update_upload_status(
+                    &runtime,
+                    &request_id,
+                    None,
+                    None,
+                    UploadPhase::Failed,
+                    None,
+                    format!("{err:#}"),
+                );
                 runtime.log(
                     "relay",
                     format!("replay upload failed request_id={request_id}: {err:#}; giving up"),
@@ -563,8 +729,13 @@ where
         })
         .unwrap_or(false);
     if let (Some(path), Some(request_id)) = (local_path, request_id) {
+        let file_name = safe_path_name(&path);
+        let size_bytes = payload
+            .get("size_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         state.lock().unwrap().replay_uploads.insert(
-            request_id,
+            request_id.clone(),
             PendingReplayUpload {
                 path,
                 payload: payload.clone(),
@@ -574,6 +745,15 @@ where
         runtime.update(|status| {
             status.relay.pending_uploads = state.lock().unwrap().replay_uploads.len();
         });
+        update_upload_status(
+            &runtime,
+            &request_id,
+            Some(file_name),
+            Some(size_bytes),
+            UploadPhase::WaitingForUrl,
+            Some(0),
+            "waiting for presigned upload URL",
+        );
     } else if !already_tracked {
         runtime.log(
             "relay",
@@ -606,11 +786,13 @@ where
 fn flush_stale_relay_messages(
     receiver: &Receiver<Value>,
     sender: &Sender<Value>,
+    runtime: &SharedRuntime,
 ) -> (usize, HashSet<String>) {
     let mut dropped = 0;
     let mut retained = Vec::new();
     let mut retained_upload_request_ids = HashSet::new();
     while let Ok(payload) = receiver.try_recv() {
+        runtime.record_pipeline_dequeue(PipelineEdge::Relay, receiver.len());
         if is_replay_upload_presign_request(&payload) {
             if let Some(request_id) = payload.get("request_id").and_then(Value::as_str) {
                 retained_upload_request_ids.insert(request_id.to_string());
@@ -620,8 +802,10 @@ fn flush_stale_relay_messages(
             dropped += 1;
         }
     }
+    runtime.record_pipeline_drop(PipelineEdge::Relay, dropped as u64);
     for payload in retained {
-        let _ = sender.try_send(payload);
+        let accepted = sender.try_send(payload).is_ok();
+        runtime.record_pipeline_enqueue(PipelineEdge::Relay, sender.len(), accepted);
     }
     (dropped, retained_upload_request_ids)
 }
@@ -630,6 +814,7 @@ fn requeue_pending_replay_uploads(
     state: &Arc<Mutex<RelayState>>,
     sender: &Sender<Value>,
     queued_request_ids: &HashSet<String>,
+    runtime: &SharedRuntime,
 ) -> usize {
     let payloads: Vec<Value> = state
         .lock()
@@ -641,7 +826,9 @@ fn requeue_pending_replay_uploads(
         .collect();
     let mut requeued = 0;
     for payload in payloads {
-        if sender.try_send(payload).is_ok() {
+        let accepted = sender.try_send(payload).is_ok();
+        runtime.record_pipeline_enqueue(PipelineEdge::Relay, sender.len(), accepted);
+        if accepted {
             requeued += 1;
         }
     }
@@ -657,6 +844,53 @@ fn safe_path_name(path: &Path) -> String {
         .and_then(|value| value.to_str())
         .unwrap_or("<unknown>")
         .to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_upload_status(
+    runtime: &SharedRuntime,
+    request_id: &str,
+    file_name: Option<String>,
+    size_bytes: Option<u64>,
+    phase: UploadPhase,
+    attempts: Option<u8>,
+    detail: impl Into<String>,
+) {
+    let detail = detail.into();
+    runtime.update(|status| {
+        if let Some(upload) = status
+            .relay
+            .uploads
+            .iter_mut()
+            .find(|upload| upload.request_id == request_id)
+        {
+            if let Some(file_name) = file_name {
+                upload.file_name = file_name;
+            }
+            if let Some(size_bytes) = size_bytes {
+                upload.size_bytes = size_bytes;
+            }
+            if let Some(attempts) = attempts {
+                upload.attempts = attempts;
+            }
+            upload.phase = phase;
+            upload.detail = detail;
+            upload.updated_at = Instant::now();
+        } else {
+            status.relay.uploads.push(ReplayUploadStatus {
+                request_id: request_id.to_string(),
+                file_name: file_name.unwrap_or_default(),
+                size_bytes: size_bytes.unwrap_or(0),
+                attempts: attempts.unwrap_or(0),
+                phase,
+                detail,
+                updated_at: Instant::now(),
+            });
+            if status.relay.uploads.len() > 32 {
+                status.relay.uploads.remove(0);
+            }
+        }
+    });
 }
 
 async fn send_relay_loop<W>(
@@ -679,11 +913,56 @@ where
     let mut terminal_status_sent_for_game_id: Option<String> = None;
 
     loop {
-        if matches!(
-            control_receiver.try_recv(),
-            Ok(RelayCommand::ReconnectNow)
-        ) {
-            return Ok(RelayLoopExit::ReconnectRequested);
+        while let Ok(command) = control_receiver.try_recv() {
+            match command {
+                RelayCommand::ReconnectNow => return Ok(RelayLoopExit::ReconnectRequested),
+                RelayCommand::RetryUpload(request_id) => {
+                    let payload = state
+                        .lock()
+                        .unwrap()
+                        .replay_uploads
+                        .get(&request_id)
+                        .map(|pending| pending.payload.clone());
+                    if let Some(payload) = payload {
+                        update_upload_status(
+                            &runtime,
+                            &request_id,
+                            None,
+                            None,
+                            UploadPhase::WaitingForUrl,
+                            None,
+                            "manual retry requested",
+                        );
+                        send_control_message(write, state.clone(), payload, runtime.clone())
+                            .await?;
+                    } else {
+                        update_upload_status(
+                            &runtime,
+                            &request_id,
+                            None,
+                            None,
+                            UploadPhase::Failed,
+                            None,
+                            "upload is no longer pending",
+                        );
+                    }
+                }
+                RelayCommand::CancelUpload(request_id) => {
+                    state.lock().unwrap().replay_uploads.remove(&request_id);
+                    runtime.update(|status| {
+                        status.relay.pending_uploads = state.lock().unwrap().replay_uploads.len();
+                    });
+                    update_upload_status(
+                        &runtime,
+                        &request_id,
+                        None,
+                        None,
+                        UploadPhase::Cancelled,
+                        None,
+                        "cancelled by user",
+                    );
+                }
+            }
         }
 
         while let Ok(payload) = outbound_control_rx.try_recv() {
@@ -692,6 +971,7 @@ where
 
         match receiver.try_recv() {
             Ok(payload) => {
+                runtime.record_pipeline_dequeue(PipelineEdge::Relay, receiver.len());
                 if is_replay_upload_presign_request(&payload) {
                     if runtime.controls.replay_uploads() {
                         send_replay_upload_presign_request(
@@ -709,10 +989,8 @@ where
 
                 let live_status = build_live_status_message(&payload);
                 let live_status_status = live_status.get("status").and_then(Value::as_str);
-                let live_status_is_terminal = matches!(
-                    live_status_status,
-                    Some("postgame" | "ended" | "stale")
-                );
+                let live_status_is_terminal =
+                    matches!(live_status_status, Some("postgame" | "ended" | "stale"));
                 let live_status_is_live = live_status_status == Some("live");
                 let live_status_source_external_id = live_status
                     .get("source_external_id")
@@ -739,9 +1017,9 @@ where
                     .get("spawn_parameters_hash")
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned);
-                let live_status_spawn_parameters_changed =
-                    live_status_spawn_parameters_hash.is_some()
-                        && live_status_spawn_parameters_hash != last_live_status_spawn_parameters_hash;
+                let live_status_spawn_parameters_changed = live_status_spawn_parameters_hash
+                    .is_some()
+                    && live_status_spawn_parameters_hash != last_live_status_spawn_parameters_hash;
                 let live_status_due = last_live_status_sent_at.elapsed() >= Duration::from_secs(10);
                 let terminal_status_due = live_status_is_terminal
                     && terminal_status_sent_for_game_id.as_deref() != Some(&live_status_game_id);
@@ -765,6 +1043,7 @@ where
                 add_key_if_needed(&mut payload, &state.lock().unwrap());
                 let message_bytes = serde_json::to_vec(&payload)?;
                 let compressed = zstd::bulk::compress(&message_bytes, 12)?;
+                runtime.record_pipeline_bytes(PipelineEdge::Relay, compressed.len() as u64);
                 write.send(Message::Binary(compressed.into())).await?;
                 runtime.update(|status| {
                     status.relay.messages_sent += 1;
@@ -812,7 +1091,10 @@ where
     <W as futures_util::Sink<Message>>::Error: std::error::Error + Send + Sync + 'static,
 {
     if let Some(map) = live_status.as_object_mut() {
-        map.insert("observed_at".to_string(), Value::String(utc_now_python_iso()));
+        map.insert(
+            "observed_at".to_string(),
+            Value::String(utc_now_python_iso()),
+        );
     }
     send_control_message(write, state, live_status, runtime.clone()).await?;
     runtime.update(|status| {
@@ -868,12 +1150,22 @@ fn strip_tick(data: &Value) -> Value {
     copy_field(&mut root, data, "variant");
     copy_field(&mut root, data, "game_engine_has_teams");
     copy_field(&mut root, data, "multiplayer_map_name");
-    copy_subfields(&mut root, data, "game_time_info", &["game_time", "real_time_elapsed"]);
+    copy_subfields(
+        &mut root,
+        data,
+        "game_time_info",
+        &["game_time", "real_time_elapsed"],
+    );
     copy_subfields(
         &mut root,
         data,
         "map_info",
-        &["cache_version", "build_version", "scenario_name", "checksum"],
+        &[
+            "cache_version",
+            "build_version",
+            "scenario_name",
+            "checksum",
+        ],
     );
     copy_field(&mut root, data, "damage_counts");
     copy_datetime_field(&mut root, data, "current_time");
@@ -960,14 +1252,20 @@ fn copy_players(root: &mut Map<String, Value>, data: &Value) {
             }
             map.insert("damage_table".to_string(), Value::Array(rows));
         }
-        if let Some(camera) = player.get("observer_camera_info").and_then(Value::as_object) {
+        if let Some(camera) = player
+            .get("observer_camera_info")
+            .and_then(Value::as_object)
+        {
             let mut camera_map = Map::new();
             for field in ["x", "y", "z", "x_aim", "y_aim", "z_aim", "fov"] {
                 if let Some(value) = camera.get(field) {
                     camera_map.insert(field.to_string(), value.clone());
                 }
             }
-            map.insert("observer_camera_info".to_string(), Value::Object(camera_map));
+            map.insert(
+                "observer_camera_info".to_string(),
+                Value::Object(camera_map),
+            );
         }
         if let Some(fpw) = player.get("first_person_weapon").and_then(Value::as_object) {
             let mut fpw_map = Map::new();
@@ -1017,7 +1315,15 @@ fn copy_spawns(root: &mut Map<String, Value>, data: &Value) {
     let mut stripped = Vec::new();
     for spawn in spawns {
         let mut map = Map::new();
-        for field in ["spawn_id", "x", "y", "z", "facing", "team_index", "gametypes"] {
+        for field in [
+            "spawn_id",
+            "x",
+            "y",
+            "z",
+            "facing",
+            "team_index",
+            "gametypes",
+        ] {
             if let Some(value) = spawn.get(field) {
                 map.insert(field.to_string(), value.clone());
             }
@@ -1076,7 +1382,10 @@ fn build_live_status_message(game_info: &Value) -> Value {
     let map_resolution_map_info = map_resolution_object
         .and_then(|object| object.get("map_info"))
         .and_then(Value::as_object);
-    let spawn_parameters_hash = game_info.get("spawn_parameters_hash").cloned().unwrap_or(Value::Null);
+    let spawn_parameters_hash = game_info
+        .get("spawn_parameters_hash")
+        .cloned()
+        .unwrap_or(Value::Null);
     let spawn_points = map_resolution_object
         .and_then(|object| object.get("spawn_points"))
         .cloned()
@@ -1238,7 +1547,9 @@ fn player_damage(game_info: &Value, player_index: i64, field: &str) -> Value {
 
 fn optional_string(value: Option<&Value>) -> Value {
     match value {
-        Some(Value::String(value)) if !value.trim().is_empty() => Value::String(value.trim().to_string()),
+        Some(Value::String(value)) if !value.trim().is_empty() => {
+            Value::String(value.trim().to_string())
+        }
         Some(Value::Number(_)) | Some(Value::Bool(_)) => Value::String(value.unwrap().to_string()),
         _ => Value::Null,
     }
@@ -1262,4 +1573,41 @@ fn utc_now_python_iso() -> String {
     chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.6f+00:00")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::RuntimeState;
+
+    #[test]
+    fn upload_status_is_created_and_updated_by_request_id() {
+        let runtime = RuntimeState::new(Config::default());
+        update_upload_status(
+            &runtime,
+            "request-1",
+            Some("game.json.zst".to_string()),
+            Some(1024),
+            UploadPhase::WaitingForUrl,
+            Some(0),
+            "waiting",
+        );
+        update_upload_status(
+            &runtime,
+            "request-1",
+            None,
+            None,
+            UploadPhase::Uploaded,
+            Some(1),
+            "complete",
+        );
+
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.status.relay.uploads.len(), 1);
+        let upload = &snapshot.status.relay.uploads[0];
+        assert_eq!(upload.file_name, "game.json.zst");
+        assert_eq!(upload.size_bytes, 1024);
+        assert_eq!(upload.attempts, 1);
+        assert_eq!(upload.phase, UploadPhase::Uploaded);
+    }
 }

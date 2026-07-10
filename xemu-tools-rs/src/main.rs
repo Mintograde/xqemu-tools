@@ -11,13 +11,17 @@ mod util;
 mod ws;
 
 use anyhow::Result;
-use config::Config;
+use config::{Config, ConfigKey};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use halo::HaloReader;
 use memory::MemoryReader;
 use qmp::QmpClient;
-use runtime::{AppCommand, Health, RelayCommand, RuntimeState, SharedRuntime};
-use serde_json::{json, Value};
+use runtime::{
+    AppCommand, CommandRequest, GameDetailStatus, Health, PipelineEdge, PlayerStatus, RelayCommand,
+    RuntimeState, SharedRuntime,
+};
+use serde_json::{Value, json};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::FILETIME;
 use windows_sys::Win32::System::ProcessStatus::{
@@ -32,13 +36,15 @@ fn main() -> Result<()> {
     let (command_tx, command_rx) = unbounded();
     let _tui = tui::start_tui(runtime.clone(), command_tx);
     runtime.log("main", "starting runtime");
-    let mut halo = connect_halo(&config, &runtime)?;
+    let Some(mut halo) = connect_halo(&config, &runtime, &command_rx)? else {
+        return Ok(());
+    };
 
     let (replay_tx, replay_rx) = unbounded();
     let (local_ws_tx, local_ws_rx) = unbounded();
     let (relay_tx, relay_rx) = unbounded();
     let (relay_command_tx, relay_command_rx) = unbounded();
-    let _replay_worker =
+    let replay_worker =
         replay::start_replay_worker(config.clone(), replay_rx, relay_tx.clone(), runtime.clone());
     let _local_ws_server = ws::start_local_ws_server(config.clone(), local_ws_rx, runtime.clone());
     let _relay_client = if config.ws_relay_enabled {
@@ -57,7 +63,7 @@ fn main() -> Result<()> {
         None
     };
 
-    main_loop(
+    let main_result = main_loop(
         &config,
         &mut halo,
         replay_tx,
@@ -65,11 +71,20 @@ fn main() -> Result<()> {
         relay_tx,
         command_rx,
         relay_command_tx,
-        runtime,
-    )
+        runtime.clone(),
+    );
+    runtime.request_shutdown();
+    if replay_worker.join().is_err() {
+        runtime.log("replay", "worker panicked during shutdown");
+    }
+    main_result
 }
 
-fn connect_halo(config: &Config, runtime: &SharedRuntime) -> Result<HaloReader> {
+fn connect_halo(
+    config: &Config,
+    runtime: &SharedRuntime,
+    command_rx: &Receiver<CommandRequest>,
+) -> Result<Option<HaloReader>> {
     runtime.update(|status| {
         status.xemu.health = Health::Starting;
         status.xemu.detail = "waiting for xemu.exe".to_string();
@@ -77,6 +92,9 @@ fn connect_halo(config: &Config, runtime: &SharedRuntime) -> Result<HaloReader> 
     });
     runtime.log("xemu", "waiting for xemu.exe");
     let xemu = loop {
+        if process_connect_commands(command_rx, runtime) {
+            return Ok(None);
+        }
         if let Some(process) = process::find_xemu_process() {
             runtime.update(|status| {
                 status.xemu.health = Health::Running;
@@ -85,7 +103,10 @@ fn connect_halo(config: &Config, runtime: &SharedRuntime) -> Result<HaloReader> 
                 status.xemu.last_error = None;
                 status.xemu.last_changed = Some(Instant::now());
             });
-            runtime.log("xemu", format!("attached to pid {} ({:#x})", process.pid, process.pid));
+            runtime.log(
+                "xemu",
+                format!("attached to pid {} ({:#x})", process.pid, process.pid),
+            );
             break process;
         }
         std::thread::sleep(Duration::from_secs(1));
@@ -98,27 +119,31 @@ fn connect_halo(config: &Config, runtime: &SharedRuntime) -> Result<HaloReader> 
         status.qmp.detail = "connecting".to_string();
         status.qmp.last_changed = Some(Instant::now());
     });
-    let qmp = match QmpClient::connect_with_retry(config.qmp_host.clone(), config.qmp_port) {
-        Ok(qmp) => {
-            runtime.update(|status| {
-                status.qmp.health = Health::Connected;
-                status.qmp.detail = "connected".to_string();
-                status.qmp.last_error = None;
-                status.qmp.last_changed = Some(Instant::now());
-            });
-            runtime.log("qmp", format!("connected to {qmp_endpoint}"));
-            qmp
-        }
-        Err(err) => {
-            runtime.update(|status| {
-                status.qmp.health = Health::Error;
-                status.qmp.detail = "connect failed".to_string();
-                status.qmp.last_error = Some(format!("{err:#}"));
-                status.qmp.last_changed = Some(Instant::now());
-            });
-            return Err(err);
-        }
-    };
+    let qmp =
+        match QmpClient::connect_with_retry_until(config.qmp_host.clone(), config.qmp_port, || {
+            process_connect_commands(command_rx, runtime)
+        }) {
+            Ok(Some(qmp)) => {
+                runtime.update(|status| {
+                    status.qmp.health = Health::Connected;
+                    status.qmp.detail = "connected".to_string();
+                    status.qmp.last_error = None;
+                    status.qmp.last_changed = Some(Instant::now());
+                });
+                runtime.log("qmp", format!("connected to {qmp_endpoint}"));
+                qmp
+            }
+            Ok(None) => return Ok(None),
+            Err(err) => {
+                runtime.update(|status| {
+                    status.qmp.health = Health::Error;
+                    status.qmp.detail = "connect failed".to_string();
+                    status.qmp.last_error = Some(format!("{err:#}"));
+                    status.qmp.last_changed = Some(Instant::now());
+                });
+                return Err(err);
+            }
+        };
 
     let memory = MemoryReader::new(xemu.pid, qmp)?;
     let mut halo = HaloReader::new(memory, config.clone())?;
@@ -132,16 +157,39 @@ fn connect_halo(config: &Config, runtime: &SharedRuntime) -> Result<HaloReader> 
         "main",
         format!("game_time host address {game_time_host_address:#x}"),
     );
-    Ok(halo)
+    Ok(Some(halo))
 }
 
+fn process_connect_commands(
+    command_rx: &Receiver<CommandRequest>,
+    runtime: &SharedRuntime,
+) -> bool {
+    let mut shutdown = false;
+    while let Ok(request) = command_rx.try_recv() {
+        runtime.start_command(request.id);
+        if matches!(request.command, AppCommand::Shutdown) {
+            runtime.request_shutdown();
+            runtime.log("main", "shutdown requested while connecting");
+            runtime.finish_command(request.id, "shutdown accepted");
+            shutdown = true;
+        } else {
+            runtime.fail_command(
+                request.id,
+                "command is unavailable while xemu and QMP are connecting",
+            );
+        }
+    }
+    shutdown
+}
+
+#[allow(clippy::too_many_arguments)]
 fn main_loop(
     config: &Config,
     halo: &mut HaloReader,
     replay_tx: Sender<Value>,
     local_ws_tx: Sender<Value>,
     relay_tx: Sender<Value>,
-    command_rx: Receiver<AppCommand>,
+    command_rx: Receiver<CommandRequest>,
     relay_command_tx: Sender<RelayCommand>,
     runtime: SharedRuntime,
 ) -> Result<()> {
@@ -151,7 +199,7 @@ fn main_loop(
     let mut last_post_steps = 0.0f64;
     let mut benchmark_tick_count = 0u64;
     let mut benchmark_loop_count = 0u64;
-    let mut last_game_info: Option<Value> = None;
+    let mut last_game_info: Option<Arc<Value>> = None;
     let mut events: Vec<Value> = Vec::new();
     let mut last_metrics_print = Instant::now();
     let mut dropped_ticks_total = 0i64;
@@ -174,6 +222,7 @@ fn main_loop(
             &replay_tx,
             &local_ws_tx,
             &relay_tx,
+            config.ws_relay_enabled,
             &runtime,
             &mut counter,
             &mut last_game_time,
@@ -225,27 +274,43 @@ fn process_commands(
     config: &Config,
     halo: &mut HaloReader,
     last_game_time: &mut Option<i64>,
-    command_rx: &Receiver<AppCommand>,
+    command_rx: &Receiver<CommandRequest>,
     relay_command_tx: &Sender<RelayCommand>,
     runtime: &SharedRuntime,
 ) -> Result<bool> {
-    while let Ok(command) = command_rx.try_recv() {
-        match command {
+    while let Ok(request) = command_rx.try_recv() {
+        let command_id = request.id;
+        runtime.start_command(command_id);
+        match request.command {
             AppCommand::Shutdown => {
+                runtime.request_shutdown();
                 runtime.log("main", "shutdown requested");
+                runtime.finish_command(command_id, "shutdown accepted");
                 return Ok(true);
             }
             AppCommand::ReconnectRelay => {
-                let _ = relay_command_tx.try_send(RelayCommand::ReconnectNow);
-                runtime.log("relay", "manual reconnect requested");
+                if relay_command_tx
+                    .try_send(RelayCommand::ReconnectNow)
+                    .is_ok()
+                {
+                    runtime.log("relay", "manual reconnect requested");
+                    runtime.finish_command(command_id, "reconnect requested");
+                } else {
+                    runtime.fail_command(command_id, "relay worker is not available");
+                }
             }
             AppCommand::ReconnectXemu => {
                 runtime.log("xemu", "manual full reconnect requested");
-                match connect_halo(config, runtime) {
-                    Ok(new_halo) => {
+                match connect_halo(config, runtime, command_rx) {
+                    Ok(Some(new_halo)) => {
                         *halo = new_halo;
                         *last_game_time = None;
                         runtime.log("xemu", "full reconnect complete");
+                        runtime.finish_command(command_id, "xemu and QMP reconnected");
+                    }
+                    Ok(None) => {
+                        runtime.fail_command(command_id, "reconnect interrupted by shutdown");
+                        return Ok(true);
                     }
                     Err(err) => {
                         runtime.update(|status| {
@@ -253,6 +318,7 @@ fn process_commands(
                             status.main.last_error = Some(format!("{err:#}"));
                         });
                         runtime.log("xemu", format!("full reconnect failed: {err:#}"));
+                        runtime.fail_command(command_id, format!("{err:#}"));
                     }
                 }
             }
@@ -269,6 +335,7 @@ fn process_commands(
                             status.qmp.last_changed = Some(Instant::now());
                         });
                         runtime.log("qmp", "manual reconnect complete");
+                        runtime.finish_command(command_id, "QMP reconnected");
                     }
                     Err(err) => {
                         runtime.update(|status| {
@@ -278,23 +345,108 @@ fn process_commands(
                             status.qmp.last_changed = Some(Instant::now());
                         });
                         runtime.log("qmp", format!("manual reconnect failed: {err:#}"));
+                        runtime.fail_command(command_id, format!("{err:#}"));
                     }
                 }
             }
             AppCommand::ToggleReplaySaving => {
-                let enabled = runtime.controls.toggle_save_replays();
-                runtime.log("replay", format!("replay saving {}", on_off(enabled)));
+                let enabled = !runtime.controls.save_replays();
+                match runtime.update_config_value(ConfigKey::SaveReplays, &enabled.to_string()) {
+                    Ok(_) => {
+                        runtime.log("replay", format!("replay saving {}", on_off(enabled)));
+                        runtime.finish_command(
+                            command_id,
+                            format!("replay saving {}", on_off(enabled)),
+                        );
+                    }
+                    Err(err) => runtime.fail_command(command_id, format!("{err:#}")),
+                }
             }
             AppCommand::ToggleSaveAllTicks => {
-                let enabled = runtime.controls.toggle_save_all_ticks();
-                runtime.log("replay", format!("save all ticks {}", on_off(enabled)));
+                let enabled = !runtime.controls.save_all_ticks();
+                match runtime.update_config_value(ConfigKey::SaveAllTicks, &enabled.to_string()) {
+                    Ok(_) => {
+                        runtime.log("replay", format!("save all ticks {}", on_off(enabled)));
+                        runtime
+                            .finish_command(command_id, format!("tick saving {}", on_off(enabled)));
+                    }
+                    Err(err) => runtime.fail_command(command_id, format!("{err:#}")),
+                }
             }
             AppCommand::ToggleReplayUploads => {
-                let enabled = runtime.controls.toggle_replay_uploads();
-                runtime.log("replay", format!("replay uploads {}", on_off(enabled)));
+                let enabled = !runtime.controls.replay_uploads();
+                match runtime.update_config_value(ConfigKey::ReplayUploads, &enabled.to_string()) {
+                    Ok(_) => {
+                        runtime.log("replay", format!("replay uploads {}", on_off(enabled)));
+                        runtime.finish_command(command_id, format!("uploads {}", on_off(enabled)));
+                    }
+                    Err(err) => runtime.fail_command(command_id, format!("{err:#}")),
+                }
             }
             AppCommand::ClearLogs => {
                 runtime.clear_logs();
+                runtime.finish_command(command_id, "logs cleared");
+            }
+            AppCommand::SetConfigValue { key, value } => {
+                match runtime.update_config_value(key, &value) {
+                    Ok((path, restart_required)) => {
+                        let detail = if restart_required {
+                            format!("saved to {path}; application restart required")
+                        } else {
+                            format!("saved and applied from {path}")
+                        };
+                        runtime.log("config", detail.clone());
+                        runtime.finish_command(command_id, detail);
+                    }
+                    Err(err) => runtime.fail_command(command_id, format!("{err:#}")),
+                }
+            }
+            AppCommand::ReloadConfig => match runtime.reload_config() {
+                Ok(pending) => {
+                    let detail = if pending.is_empty() {
+                        "configuration reloaded and applied".to_string()
+                    } else {
+                        format!(
+                            "configuration reloaded; restart required for {}",
+                            pending
+                                .iter()
+                                .map(|key| key.label())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    };
+                    runtime.log("config", detail.clone());
+                    runtime.finish_command(command_id, detail);
+                }
+                Err(err) => runtime.fail_command(command_id, format!("{err:#}")),
+            },
+            AppCommand::RetryUpload(request_id) => {
+                if relay_command_tx
+                    .try_send(RelayCommand::RetryUpload(request_id))
+                    .is_ok()
+                {
+                    runtime.finish_command(command_id, "upload retry requested");
+                } else {
+                    runtime.fail_command(command_id, "relay worker is not available");
+                }
+            }
+            AppCommand::CancelUpload(request_id) => {
+                if relay_command_tx
+                    .try_send(RelayCommand::CancelUpload(request_id))
+                    .is_ok()
+                {
+                    runtime.finish_command(command_id, "upload cancellation requested");
+                } else {
+                    runtime.fail_command(command_id, "relay worker is not available");
+                }
+            }
+            AppCommand::DisconnectClient(address) => {
+                runtime.request_client_disconnect(address.clone());
+                runtime.finish_command(command_id, format!("disconnect requested for {address}"));
+            }
+            AppCommand::DiscardReplay => {
+                runtime.request_replay_discard();
+                runtime.finish_command(command_id, "replay discard requested");
             }
         }
     }
@@ -307,6 +459,7 @@ fn tick_once(
     replay_tx: &Sender<Value>,
     local_ws_tx: &Sender<Value>,
     relay_tx: &Sender<Value>,
+    relay_enabled: bool,
     runtime: &SharedRuntime,
     counter: &mut u64,
     last_game_time: &mut Option<i64>,
@@ -314,7 +467,7 @@ fn tick_once(
     last_post_steps: &mut f64,
     benchmark_tick_count: &mut u64,
     benchmark_loop_count: &mut u64,
-    last_game_info: &mut Option<Value>,
+    last_game_info: &mut Option<Arc<Value>>,
     events: &mut Vec<Value>,
     dropped_ticks_total: &mut i64,
     last_metrics_print: &mut Instant,
@@ -410,9 +563,28 @@ fn tick_once(
 
         *last_real_time = real_time;
         let post_steps_start = Instant::now();
-        let _ = replay_tx.try_send(game_info.clone());
-        let _ = local_ws_tx.try_send(game_info.clone());
-        let _ = relay_tx.try_send(game_info.clone());
+        let game_info = Arc::new(game_info);
+        enqueue_pipeline_value(
+            replay_tx,
+            game_info.as_ref().clone(),
+            PipelineEdge::Replay,
+            runtime,
+        );
+        enqueue_pipeline_value(
+            local_ws_tx,
+            game_info.as_ref().clone(),
+            PipelineEdge::LocalWebSocket,
+            runtime,
+        );
+        if relay_enabled {
+            enqueue_pipeline_value(
+                relay_tx,
+                game_info.as_ref().clone(),
+                PipelineEdge::Relay,
+                runtime,
+            );
+        }
+        runtime.set_latest_game_info(game_info.clone());
         *last_game_info = Some(game_info);
         *last_post_steps = post_steps_start.elapsed().as_secs_f64() * 1000.0;
         update_main_status(
@@ -451,6 +623,16 @@ fn tick_once(
     Ok(())
 }
 
+fn enqueue_pipeline_value(
+    sender: &Sender<Value>,
+    value: Value,
+    edge: PipelineEdge,
+    runtime: &SharedRuntime,
+) {
+    let accepted = sender.try_send(value).is_ok();
+    runtime.record_pipeline_enqueue(edge, sender.len(), accepted);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn update_main_status(
     runtime: &SharedRuntime,
@@ -470,6 +652,7 @@ fn update_main_status(
     } else {
         0.0
     };
+    let game_detail = game_detail_status(game_info);
     runtime.update(|status| {
         status.main.health = Health::Running;
         status.main.game_time = game_time;
@@ -502,7 +685,114 @@ fn update_main_status(
             .unwrap_or(0);
         status.main.last_error = None;
         status.main.last_tick_at = Some(Instant::now());
+        status.game = game_detail;
     });
+}
+
+fn game_detail_status(game_info: &Value) -> GameDetailStatus {
+    let players = game_info
+        .get("players")
+        .and_then(Value::as_array)
+        .map(|players| {
+            players
+                .iter()
+                .map(|player| {
+                    let object = player.get("player_object_data");
+                    PlayerStatus {
+                        index: int_field(player, "player_index"),
+                        name: string_field(player, "name"),
+                        team: int_field(player, "team"),
+                        score: int_field(player, "score"),
+                        kills: int_field(player, "kills"),
+                        deaths: int_field(player, "deaths"),
+                        assists: int_field(player, "assists"),
+                        shots_fired: int_field(player, "shots_fired"),
+                        shots_hit: int_field(player, "shots_hit"),
+                        quit: int_field(player, "player_quit") != 0,
+                        has_camo: bool_path(player, &["derived_stats", "has_camo"]),
+                        has_overshield: bool_path(player, &["derived_stats", "has_overshield"]),
+                        health: object
+                            .and_then(|value| value.get("health"))
+                            .and_then(Value::as_f64)
+                            .unwrap_or(0.0),
+                        shields: object
+                            .and_then(|value| value.get("shields"))
+                            .and_then(Value::as_f64)
+                            .unwrap_or(0.0),
+                        position: [
+                            object
+                                .and_then(|value| value.get("x"))
+                                .and_then(Value::as_f64)
+                                .unwrap_or(0.0),
+                            object
+                                .and_then(|value| value.get("y"))
+                                .and_then(Value::as_f64)
+                                .unwrap_or(0.0),
+                            object
+                                .and_then(|value| value.get("z"))
+                                .and_then(Value::as_f64)
+                                .unwrap_or(0.0),
+                        ],
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let recent_events = game_info
+        .get("events")
+        .and_then(Value::as_array)
+        .map(|events| {
+            events
+                .iter()
+                .rev()
+                .take(25)
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect()
+        })
+        .unwrap_or_default();
+    GameDetailStatus {
+        game_type: display_value(game_info.get("game_type")),
+        variant: display_value(game_info.get("variant")),
+        stage: string_field(game_info, "global_stage"),
+        has_teams: int_field(game_info, "game_engine_has_teams") != 0,
+        local_player_count: int_field(game_info, "local_player_count").max(0) as usize,
+        object_count: array_len(game_info, "objects"),
+        item_count: array_len(game_info, "items"),
+        spawn_count: array_len(game_info, "spawns"),
+        players,
+        recent_events,
+    }
+}
+
+fn int_field(value: &Value, field: &str) -> i64 {
+    value.get(field).and_then(Value::as_i64).unwrap_or(0)
+}
+
+fn bool_path(value: &Value, path: &[&str]) -> bool {
+    path.iter()
+        .try_fold(value, |current, key| current.get(*key))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn array_len(value: &Value, field: &str) -> usize {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
+}
+
+fn display_value(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(value)) => value.clone(),
+        Some(Value::Null) | None => String::new(),
+        Some(value) => value.to_string(),
+    }
 }
 
 fn update_resource_status(runtime: &SharedRuntime, usage: &AppResourceUsage) {
@@ -677,4 +967,57 @@ fn filetime_to_u64(filetime: FILETIME) -> u64 {
 
 fn bytes_to_mbytes(bytes: usize) -> f64 {
     bytes as f64 / 1024.0 / 1024.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use runtime::CommandPhase;
+
+    #[test]
+    fn shutdown_is_processed_while_waiting_for_connections() {
+        let runtime = RuntimeState::new(Config::default());
+        let (sender, receiver) = unbounded();
+        let request = runtime.queue_command(AppCommand::Shutdown);
+        sender.send(request).unwrap();
+
+        assert!(process_connect_commands(&receiver, &runtime));
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.commands[0].phase, CommandPhase::Succeeded);
+        assert!(runtime.shutdown_requested());
+    }
+
+    #[test]
+    fn game_detail_snapshot_extracts_player_and_entity_summaries() {
+        let detail = game_detail_status(&json!({
+            "game_type": "slayer",
+            "variant": 2,
+            "global_stage": "bloodgulch",
+            "game_engine_has_teams": 1,
+            "local_player_count": 1,
+            "objects": [{}, {}],
+            "items": [{}],
+            "spawns": [{}, {}, {}],
+            "events": ["one", "two"],
+            "players": [{
+                "player_index": 0,
+                "name": "Player",
+                "team": 1,
+                "score": 10,
+                "kills": 4,
+                "deaths": 2,
+                "assists": 1,
+                "shots_fired": 20,
+                "shots_hit": 10,
+                "derived_stats": {"has_camo": true, "has_overshield": false},
+                "player_object_data": {"health": 0.75, "shields": 1.0, "x": 1.0, "y": 2.0, "z": 3.0},
+            }],
+        }));
+        assert_eq!(detail.players.len(), 1);
+        assert_eq!(detail.players[0].kills, 4);
+        assert_eq!(detail.players[0].position, [1.0, 2.0, 3.0]);
+        assert_eq!(detail.object_count, 2);
+        assert_eq!(detail.spawn_count, 3);
+        assert_eq!(detail.recent_events, vec!["one", "two"]);
+    }
 }

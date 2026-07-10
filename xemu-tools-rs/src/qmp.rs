@@ -1,5 +1,5 @@
-use anyhow::{anyhow, bail, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, anyhow, bail};
+use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::thread;
@@ -13,15 +13,27 @@ pub struct QmpClient {
 }
 
 impl QmpClient {
-    pub fn connect_with_retry(host: impl Into<String>, port: u16) -> Result<Self> {
+    pub fn connect_with_retry_until(
+        host: impl Into<String>,
+        port: u16,
+        mut should_cancel: impl FnMut() -> bool,
+    ) -> Result<Option<Self>> {
         let host = host.into();
         let mut attempt = 0;
         loop {
+            if should_cancel() {
+                return Ok(None);
+            }
             match Self::connect(&host, port) {
-                Ok(client) => return Ok(client),
+                Ok(client) => return Ok(Some(client)),
                 Err(_) if attempt < 5 => {
                     attempt += 1;
-                    thread::sleep(Duration::from_secs(1));
+                    for _ in 0..10 {
+                        if should_cancel() {
+                            return Ok(None);
+                        }
+                        thread::sleep(Duration::from_millis(100));
+                    }
                 }
                 Err(err) => return Err(err),
             }
@@ -128,4 +140,16 @@ fn parse_hex_u64(value: &str) -> Result<u64> {
         bail!("empty hex string")
     }
     Ok(u64::from_str_radix(value, 16)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_can_be_cancelled_before_connecting() -> Result<()> {
+        let client = QmpClient::connect_with_retry_until("127.0.0.1", 1, || true)?;
+        assert!(client.is_none());
+        Ok(())
+    }
 }

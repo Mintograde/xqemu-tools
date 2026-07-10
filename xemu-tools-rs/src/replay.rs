@@ -1,16 +1,16 @@
 use crate::config::Config;
-use crate::runtime::{Health, SharedRuntime};
+use crate::runtime::{Health, PipelineEdge, ReplayFileStatus, SharedRuntime};
 use crate::util::timedelta_seconds_floor;
 use anyhow::{Context, Result};
 use chrono::NaiveDateTime;
-use crossbeam_channel::{Receiver, Sender};
-use serde_json::{json, Map, Value};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const FINAL_REPLAY_COMPRESSION_LEVEL: i32 = 11;
@@ -55,11 +55,17 @@ fn replay_worker(
     let mut meta = Value::Array(Vec::new());
     let mut gametype_settings = Value::Array(Vec::new());
     let mut network_game_client = Value::Array(Vec::new());
+    let mut recording_started_at: Option<Instant> = None;
+    let mut last_spool_sample = Instant::now() - Duration::from_secs(2);
+    let mut last_spool_bytes = 0u64;
 
-    while let Ok(mut game_info) = receiver.recv() {
-        if !runtime.controls.save_replays() {
+    loop {
+        if runtime.shutdown_requested() {
+            break;
+        }
+        if runtime.take_replay_discard_request() {
             if first_tick.is_some() {
-                runtime.log("replay", "discarded in-progress replay because saving is disabled");
+                runtime.log("replay", "discarding in-progress replay by user request");
             }
             reset_recording(
                 &mut tick_spool,
@@ -68,6 +74,44 @@ fn replay_worker(
                 &mut ticks_recorded,
                 &mut tick_buffer_complete,
             );
+            recording_started_at = None;
+            last_spool_bytes = 0;
+            runtime.update(|status| {
+                status.replay.recording = false;
+                status.replay.current_game_id.clear();
+                status.replay.ticks_recorded = 0;
+                status.replay.ticks_buffered = 0;
+                status.replay.spool_path.clear();
+                status.replay.spool_bytes = 0;
+                status.replay.last_changed = Some(Instant::now());
+            });
+            continue;
+        }
+        let mut game_info = match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(game_info) => game_info,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        if runtime.shutdown_requested() {
+            break;
+        }
+        runtime.record_pipeline_dequeue(PipelineEdge::Replay, receiver.len());
+        if !runtime.controls.save_replays() {
+            if first_tick.is_some() {
+                runtime.log(
+                    "replay",
+                    "discarded in-progress replay because saving is disabled",
+                );
+            }
+            reset_recording(
+                &mut tick_spool,
+                &mut first_tick,
+                &mut last_tick,
+                &mut ticks_recorded,
+                &mut tick_buffer_complete,
+            );
+            recording_started_at = None;
+            last_spool_bytes = 0;
             runtime.update(|status| {
                 status.replay.health = Health::Running;
                 status.replay.recording = false;
@@ -75,6 +119,9 @@ fn replay_worker(
                 status.replay.current_game_id.clear();
                 status.replay.ticks_recorded = 0;
                 status.replay.ticks_buffered = 0;
+                status.replay.started_at = None;
+                status.replay.spool_path.clear();
+                status.replay.spool_bytes = 0;
                 status.replay.last_error = None;
             });
             continue;
@@ -94,10 +141,18 @@ fn replay_worker(
             .unwrap_or(false);
 
         if let Some(map) = game_info.as_object_mut() {
-            events = map.remove("events").unwrap_or_else(|| Value::Array(Vec::new()));
-            spawns = map.remove("spawns").unwrap_or_else(|| Value::Array(Vec::new()));
-            items = map.remove("items").unwrap_or_else(|| Value::Array(Vec::new()));
-            meta = map.remove("game_meta").unwrap_or_else(|| Value::Array(Vec::new()));
+            events = map
+                .remove("events")
+                .unwrap_or_else(|| Value::Array(Vec::new()));
+            spawns = map
+                .remove("spawns")
+                .unwrap_or_else(|| Value::Array(Vec::new()));
+            items = map
+                .remove("items")
+                .unwrap_or_else(|| Value::Array(Vec::new()));
+            meta = map
+                .remove("game_meta")
+                .unwrap_or_else(|| Value::Array(Vec::new()));
             gametype_settings = map
                 .remove("gametype_settings")
                 .unwrap_or_else(|| Value::Array(Vec::new()));
@@ -108,6 +163,7 @@ fn replay_worker(
 
         if first_tick.is_none() {
             first_tick = Some(game_info.clone());
+            recording_started_at = Some(Instant::now());
             tick_buffer_complete = runtime.controls.save_all_ticks();
             if tick_buffer_complete {
                 tick_spool = Some(TickSpool::new(&config.replay_directory, &game_id)?);
@@ -126,6 +182,25 @@ fn replay_worker(
             discard_tick_spool(&mut tick_spool);
         }
 
+        let spool_path = tick_spool
+            .as_ref()
+            .and_then(TickSpool::path)
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        if last_spool_sample.elapsed() >= Duration::from_secs(1) {
+            last_spool_sample = Instant::now();
+            let sampled_spool_bytes = tick_spool
+                .as_ref()
+                .and_then(TickSpool::path)
+                .and_then(|path| fs::metadata(path).ok())
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            runtime.record_pipeline_bytes(
+                PipelineEdge::Replay,
+                sampled_spool_bytes.saturating_sub(last_spool_bytes),
+            );
+            last_spool_bytes = sampled_spool_bytes;
+        }
         runtime.update(|status| {
             status.replay.health = Health::Running;
             status.replay.recording = true;
@@ -133,6 +208,9 @@ fn replay_worker(
             status.replay.ticks_recorded = ticks_recorded;
             status.replay.ticks_buffered = tick_spool.as_ref().map(TickSpool::ticks).unwrap_or(0);
             status.replay.queue_depth = receiver.len();
+            status.replay.started_at = recording_started_at;
+            status.replay.spool_path = spool_path;
+            status.replay.spool_bytes = last_spool_bytes;
             status.replay.last_error = None;
         });
 
@@ -149,10 +227,7 @@ fn replay_worker(
         let summary =
             build_summary_from_parts(&game_id, first_tick_ref, last_tick_ref, ticks_recorded);
         let finished_tick_spool = if tick_buffer_complete {
-            tick_spool
-                .take()
-                .map(TickSpool::finish)
-                .transpose()?
+            tick_spool.take().map(TickSpool::finish).transpose()?
         } else {
             discard_tick_spool(&mut tick_spool);
             None
@@ -163,7 +238,8 @@ fn replay_worker(
         let filename = config
             .replay_directory
             .join(format!("{game_id}_final.json.zst"));
-        let data_bytes = write_final_replay_file(
+        let save_started_at = Instant::now();
+        let uncompressed_bytes = write_final_replay_file(
             &filename,
             &ReplayParts {
                 summary: &summary,
@@ -176,18 +252,37 @@ fn replay_worker(
             },
             finished_tick_spool.as_ref(),
         )?;
+        let save_duration = save_started_at.elapsed();
+        let data_bytes = fs::metadata(&filename)
+            .map(|metadata| metadata.len())
+            .unwrap_or(uncompressed_bytes);
         runtime.update(|status| {
             status.replay.saved_replays += 1;
             status.replay.last_saved_file = filename.display().to_string();
             status.replay.last_save_bytes = data_bytes;
+            status.replay.last_uncompressed_bytes = uncompressed_bytes;
+            status.replay.last_save_duration = save_duration;
+            status.replay.recent_files.push(ReplayFileStatus {
+                path: filename.display().to_string(),
+                bytes: data_bytes,
+                ticks: ticks_recorded,
+                saved_at: Instant::now(),
+                duration: save_duration,
+            });
+            if status.replay.recent_files.len() > 20 {
+                status.replay.recent_files.remove(0);
+            }
             status.replay.last_changed = Some(Instant::now());
         });
         runtime.log(
             "replay",
-            format!("saved {data_bytes} bytes to {}", filename.display()),
+            format!(
+                "saved {data_bytes} compressed bytes ({uncompressed_bytes} JSON bytes) to {}",
+                filename.display()
+            ),
         );
         if config.ws_relay_enabled && runtime.controls.replay_uploads() {
-            if let Err(err) = enqueue_replay_upload_request(&filename, &relay_sender) {
+            if let Err(err) = enqueue_replay_upload_request(&filename, &relay_sender, &runtime) {
                 runtime.update(|status| {
                     status.replay.last_error = Some(format!("{err:#}"));
                     status.replay.last_changed = Some(Instant::now());
@@ -206,7 +301,10 @@ fn replay_worker(
                 });
             }
         } else if config.ws_relay_enabled {
-            runtime.log("replay", "replay upload skipped because uploads are disabled");
+            runtime.log(
+                "replay",
+                "replay upload skipped because uploads are disabled",
+            );
         }
         reset_recording(
             &mut tick_spool,
@@ -215,14 +313,40 @@ fn replay_worker(
             &mut ticks_recorded,
             &mut tick_buffer_complete,
         );
+        recording_started_at = None;
+        last_spool_bytes = 0;
         runtime.update(|status| {
             status.replay.recording = false;
             status.replay.current_game_id.clear();
             status.replay.ticks_recorded = 0;
             status.replay.ticks_buffered = 0;
             status.replay.queue_depth = receiver.len();
+            status.replay.started_at = None;
+            status.replay.spool_path.clear();
+            status.replay.spool_bytes = 0;
         });
     }
+    if first_tick.is_some() {
+        runtime.log("replay", "discarding in-progress replay during shutdown");
+    }
+    reset_recording(
+        &mut tick_spool,
+        &mut first_tick,
+        &mut last_tick,
+        &mut ticks_recorded,
+        &mut tick_buffer_complete,
+    );
+    runtime.update(|status| {
+        status.replay.recording = false;
+        status.replay.current_game_id.clear();
+        status.replay.ticks_recorded = 0;
+        status.replay.ticks_buffered = 0;
+        status.replay.queue_depth = receiver.len();
+        status.replay.started_at = None;
+        status.replay.spool_path.clear();
+        status.replay.spool_bytes = 0;
+        status.replay.last_changed = Some(Instant::now());
+    });
     Ok(())
 }
 
@@ -256,10 +380,8 @@ impl TickSpool {
     fn new(replay_directory: &Path, game_id: &str) -> Result<Self> {
         fs::create_dir_all(replay_directory)
             .with_context(|| format!("failed to create {:?}", replay_directory))?;
-        let path = replay_directory.join(format!(
-            ".{game_id}_{}.ticks.json.zst.tmp",
-            Uuid::new_v4()
-        ));
+        let path =
+            replay_directory.join(format!(".{game_id}_{}.ticks.json.zst.tmp", Uuid::new_v4()));
         let file = File::create(&path)
             .with_context(|| format!("failed to create tick spool {}", path.display()))?;
         let writer = BufWriter::new(file);
@@ -286,7 +408,11 @@ impl TickSpool {
     }
 
     fn finish(mut self) -> Result<FinishedTickSpool> {
-        let path = self.path.as_ref().cloned().context("tick spool path missing")?;
+        let path = self
+            .path
+            .as_ref()
+            .cloned()
+            .context("tick spool path missing")?;
         let encoder = self.encoder.take().context("tick spool already finished")?;
         let mut writer = encoder
             .finish()
@@ -303,6 +429,10 @@ impl TickSpool {
 
     fn ticks(&self) -> usize {
         self.ticks
+    }
+
+    fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 }
 
@@ -363,10 +493,10 @@ fn write_final_replay_file(
     output.write_all(b",\"items\":")?;
     serde_json::to_writer(&mut output, parts.items)?;
     output.write_all(b",\"ticks\":[")?;
-    if let Some(tick_spool) = tick_spool {
-        if tick_spool.ticks > 0 {
-            copy_tick_spool(tick_spool, &mut output)?;
-        }
+    if let Some(tick_spool) = tick_spool
+        && tick_spool.ticks > 0
+    {
+        copy_tick_spool(tick_spool, &mut output)?;
     }
     output.write_all(b"]}")?;
 
@@ -425,7 +555,11 @@ impl<W: Write> Write for CountingWriter<W> {
     }
 }
 
-fn enqueue_replay_upload_request(path: &Path, relay_sender: &Sender<Value>) -> Result<()> {
+fn enqueue_replay_upload_request(
+    path: &Path,
+    relay_sender: &Sender<Value>,
+    runtime: &SharedRuntime,
+) -> Result<()> {
     let metadata = fs::metadata(path)
         .with_context(|| format!("failed to stat replay file {}", safe_file_name(path)))?;
     let filename = path
@@ -454,18 +588,18 @@ fn enqueue_replay_upload_request(path: &Path, relay_sender: &Sender<Value>) -> R
     }
     let sha256 = format!("{:x}", hasher.finalize());
 
-    relay_sender
-        .try_send(json!({
-            "type": "replay_upload_presign_request",
-            "request_id": Uuid::new_v4().to_string(),
-            "source_external_id": source_external_id,
-            "filename": filename,
-            "content_type": "application/zstd",
-            "size_bytes": metadata.len(),
-            "sha256": sha256,
-            "_local_file_path": path.to_string_lossy(),
-        }))
-        .context("failed to enqueue replay upload request")?;
+    let result = relay_sender.try_send(json!({
+        "type": "replay_upload_presign_request",
+        "request_id": Uuid::new_v4().to_string(),
+        "source_external_id": source_external_id,
+        "filename": filename,
+        "content_type": "application/zstd",
+        "size_bytes": metadata.len(),
+        "sha256": sha256,
+        "_local_file_path": path.to_string_lossy(),
+    }));
+    runtime.record_pipeline_enqueue(PipelineEdge::Relay, relay_sender.len(), result.is_ok());
+    result.context("failed to enqueue replay upload request")?;
     Ok(())
 }
 
@@ -521,7 +655,11 @@ fn build_summary_from_parts(
 fn tick_number(tick: &Value) -> i64 {
     tick.get("game_time_info")
         .and_then(|info| info.get("game_time"))
-        .and_then(|value| value.as_i64().or_else(|| value.as_u64().map(|value| value as i64)))
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().map(|value| value as i64))
+        })
         .unwrap_or(0)
 }
 
@@ -594,6 +732,68 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn shutdown_removes_in_progress_tick_spool() -> Result<()> {
+        let dir = test_dir()?;
+        let config = Config {
+            replay_directory: dir.clone(),
+            ..Config::default()
+        };
+        let runtime = crate::runtime::RuntimeState::new(config.clone());
+        let (tick_sender, tick_receiver) = crossbeam_channel::unbounded();
+        let (relay_sender, _relay_receiver) = crossbeam_channel::unbounded();
+        let worker = start_replay_worker(config, tick_receiver, relay_sender, runtime.clone());
+
+        tick_sender.send(json!({
+            "game_id": "shutdown-test",
+            "game_ended_this_tick": false,
+        }))?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !runtime.snapshot().status.replay.recording && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(runtime.snapshot().status.replay.recording);
+        assert_eq!(temporary_spools(&dir)?.len(), 1);
+
+        runtime.request_shutdown();
+        drop(tick_sender);
+        worker.join().expect("replay worker should stop cleanly");
+
+        assert!(temporary_spools(&dir)?.is_empty());
+        assert!(!runtime.snapshot().status.replay.recording);
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn discard_command_removes_spool_without_stopping_worker() -> Result<()> {
+        let dir = test_dir()?;
+        let config = Config {
+            replay_directory: dir.clone(),
+            ..Config::default()
+        };
+        let runtime = crate::runtime::RuntimeState::new(config.clone());
+        let (tick_sender, tick_receiver) = crossbeam_channel::unbounded();
+        let (relay_sender, _relay_receiver) = crossbeam_channel::unbounded();
+        let worker = start_replay_worker(config, tick_receiver, relay_sender, runtime.clone());
+        tick_sender.send(json!({
+            "game_id": "discard-test",
+            "game_ended_this_tick": false,
+        }))?;
+        wait_for_recording_state(&runtime, true);
+        assert_eq!(temporary_spools(&dir)?.len(), 1);
+
+        runtime.request_replay_discard();
+        wait_for_recording_state(&runtime, false);
+        assert!(temporary_spools(&dir)?.is_empty());
+
+        runtime.request_shutdown();
+        drop(tick_sender);
+        worker.join().expect("replay worker should stop cleanly");
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
     struct TestReplayValues {
         summary: Value,
         game_meta: Value,
@@ -650,5 +850,24 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("xemu-tools-rs-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&dir)?;
         Ok(dir)
+    }
+
+    fn temporary_spools(dir: &Path) -> Result<Vec<PathBuf>> {
+        Ok(fs::read_dir(dir)?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".ticks.json.zst.tmp"))
+            })
+            .collect())
+    }
+
+    fn wait_for_recording_state(runtime: &SharedRuntime, recording: bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while runtime.snapshot().status.replay.recording != recording && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(runtime.snapshot().status.replay.recording, recording);
     }
 }

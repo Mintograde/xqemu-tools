@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub websocket_host: String,
     pub websocket_port: u16,
@@ -18,6 +18,8 @@ pub struct Config {
     pub save_replays: bool,
     pub save_all_ticks: bool,
     pub replay_uploads_enabled: bool,
+    pub source_path: Option<PathBuf>,
+    pub environment_overrides: Vec<ConfigKey>,
 }
 
 impl Default for Config {
@@ -35,6 +37,8 @@ impl Default for Config {
             save_replays: true,
             save_all_ticks: true,
             replay_uploads_enabled: true,
+            source_path: None,
+            environment_overrides: Vec::new(),
         }
     }
 }
@@ -43,50 +47,294 @@ impl Config {
     pub fn load() -> Result<Self> {
         let mut config = Self::default();
         if let Some(path) = env::var_os("XEMU_TOOLS_CONFIG") {
-            apply_config_file(&mut config, PathBuf::from(path), true)?;
+            let path = PathBuf::from(path);
+            apply_config_file(&mut config, path.clone(), true)?;
+            config.source_path = Some(path);
         } else if let Some(path) = find_config_file() {
-            apply_config_file(&mut config, path, false)?;
+            apply_config_file(&mut config, path.clone(), false)?;
+            config.source_path = Some(path);
         }
         config.apply_env_overrides();
         Ok(config)
     }
 
+    pub fn save(&mut self) -> Result<PathBuf> {
+        let path = self.source_path.clone().unwrap_or_else(|| {
+            env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join("config.toml")
+        });
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create config directory {}", parent.display())
+            })?;
+        }
+        let contents = toml::to_string_pretty(&PersistedConfig::from(&*self))?;
+        fs::write(&path, contents)
+            .with_context(|| format!("failed to write config file {}", path.display()))?;
+        self.source_path = Some(path.clone());
+        Ok(path)
+    }
+
+    pub fn apply_value(&mut self, key: ConfigKey, value: &str) -> Result<()> {
+        let value = value.trim();
+        match key {
+            ConfigKey::WebsocketHost => self.websocket_host = non_empty(key, value)?,
+            ConfigKey::WebsocketPort => self.websocket_port = parse_port(key, value)?,
+            ConfigKey::QmpHost => self.qmp_host = non_empty(key, value)?,
+            ConfigKey::QmpPort => self.qmp_port = parse_port(key, value)?,
+            ConfigKey::ReplayDirectory => {
+                self.replay_directory = PathBuf::from(non_empty(key, value)?)
+            }
+            ConfigKey::RelayEnabled => self.ws_relay_enabled = parse_bool(key, value)?,
+            ConfigKey::RelayBaseUrl => self.ws_relay_base_url = non_empty(key, value)?,
+            ConfigKey::RelayRoom => self.ws_relay_room = non_empty(key, value)?,
+            ConfigKey::SpawnHash => self.compute_spawn_parameters_hash = parse_bool(key, value)?,
+            ConfigKey::SaveReplays => self.save_replays = parse_bool(key, value)?,
+            ConfigKey::SaveAllTicks => self.save_all_ticks = parse_bool(key, value)?,
+            ConfigKey::ReplayUploads => self.replay_uploads_enabled = parse_bool(key, value)?,
+        }
+        Ok(())
+    }
+
+    pub fn value(&self, key: ConfigKey) -> String {
+        match key {
+            ConfigKey::WebsocketHost => self.websocket_host.clone(),
+            ConfigKey::WebsocketPort => self.websocket_port.to_string(),
+            ConfigKey::QmpHost => self.qmp_host.clone(),
+            ConfigKey::QmpPort => self.qmp_port.to_string(),
+            ConfigKey::ReplayDirectory => self.replay_directory.display().to_string(),
+            ConfigKey::RelayEnabled => self.ws_relay_enabled.to_string(),
+            ConfigKey::RelayBaseUrl => self.ws_relay_base_url.clone(),
+            ConfigKey::RelayRoom => self.ws_relay_room.clone(),
+            ConfigKey::SpawnHash => self.compute_spawn_parameters_hash.to_string(),
+            ConfigKey::SaveReplays => self.save_replays.to_string(),
+            ConfigKey::SaveAllTicks => self.save_all_ticks.to_string(),
+            ConfigKey::ReplayUploads => self.replay_uploads_enabled.to_string(),
+        }
+    }
+
     fn apply_env_overrides(&mut self) {
         if let Ok(value) = env::var("WEBSOCKET_HOST") {
             self.websocket_host = value;
+            self.environment_overrides.push(ConfigKey::WebsocketHost);
         }
         if let Some(value) = env_u16("WEBSOCKET_PORT") {
             self.websocket_port = value;
+            self.environment_overrides.push(ConfigKey::WebsocketPort);
         }
         if let Ok(value) = env::var("QMP_HOST") {
             self.qmp_host = value;
+            self.environment_overrides.push(ConfigKey::QmpHost);
         }
         if let Some(value) = env_u16("QMP_PORT") {
             self.qmp_port = value;
+            self.environment_overrides.push(ConfigKey::QmpPort);
         }
         if let Ok(value) = env::var("REPLAY_DIRECTORY") {
             self.replay_directory = PathBuf::from(value);
+            self.environment_overrides.push(ConfigKey::ReplayDirectory);
         }
         if let Some(value) = env_bool_override("ENABLE_WEBSOCKET_RELAY") {
             self.ws_relay_enabled = value;
+            self.environment_overrides.push(ConfigKey::RelayEnabled);
         }
         if let Ok(value) = env::var("WS_RELAY_BASE_URL") {
             self.ws_relay_base_url = value;
+            self.environment_overrides.push(ConfigKey::RelayBaseUrl);
         }
         if let Ok(value) = env::var("WS_RELAY_ROOM") {
             self.ws_relay_room = value;
+            self.environment_overrides.push(ConfigKey::RelayRoom);
         }
         if let Some(value) = env_bool_override("COMPUTE_SPAWN_PARAMETERS_HASH") {
             self.compute_spawn_parameters_hash = value;
+            self.environment_overrides.push(ConfigKey::SpawnHash);
         }
         if let Some(value) = env_bool_override("ENABLE_REPLAY_SAVING") {
             self.save_replays = value;
+            self.environment_overrides.push(ConfigKey::SaveReplays);
         }
         if let Some(value) = env_bool_override("SAVE_ALL_TICKS") {
             self.save_all_ticks = value;
+            self.environment_overrides.push(ConfigKey::SaveAllTicks);
         }
         if let Some(value) = env_bool_override("ENABLE_REPLAY_UPLOADS") {
             self.replay_uploads_enabled = value;
+            self.environment_overrides.push(ConfigKey::ReplayUploads);
+        }
+    }
+
+    pub fn origin(&self, key: ConfigKey) -> &'static str {
+        if self.environment_overrides.contains(&key) {
+            "environment"
+        } else if self.source_path.is_some() {
+            "config file"
+        } else {
+            "default"
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigKey {
+    WebsocketHost,
+    WebsocketPort,
+    QmpHost,
+    QmpPort,
+    ReplayDirectory,
+    RelayEnabled,
+    RelayBaseUrl,
+    RelayRoom,
+    SpawnHash,
+    SaveReplays,
+    SaveAllTicks,
+    ReplayUploads,
+}
+
+impl ConfigKey {
+    pub const ALL: [Self; 12] = [
+        Self::WebsocketHost,
+        Self::WebsocketPort,
+        Self::QmpHost,
+        Self::QmpPort,
+        Self::ReplayDirectory,
+        Self::RelayEnabled,
+        Self::RelayBaseUrl,
+        Self::RelayRoom,
+        Self::SpawnHash,
+        Self::SaveReplays,
+        Self::SaveAllTicks,
+        Self::ReplayUploads,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::WebsocketHost => "local WS host",
+            Self::WebsocketPort => "local WS port",
+            Self::QmpHost => "QMP host",
+            Self::QmpPort => "QMP port",
+            Self::ReplayDirectory => "replay directory",
+            Self::RelayEnabled => "relay enabled",
+            Self::RelayBaseUrl => "relay base URL",
+            Self::RelayRoom => "relay room",
+            Self::SpawnHash => "spawn hash",
+            Self::SaveReplays => "save replays",
+            Self::SaveAllTicks => "save all ticks",
+            Self::ReplayUploads => "replay uploads",
+        }
+    }
+
+    pub fn requires_restart(self) -> bool {
+        !matches!(
+            self,
+            Self::SaveReplays | Self::SaveAllTicks | Self::ReplayUploads
+        )
+    }
+
+    pub fn is_boolean(self) -> bool {
+        matches!(
+            self,
+            Self::RelayEnabled
+                | Self::SpawnHash
+                | Self::SaveReplays
+                | Self::SaveAllTicks
+                | Self::ReplayUploads
+        )
+    }
+}
+
+fn non_empty(key: ConfigKey, value: &str) -> Result<String> {
+    if value.is_empty() {
+        anyhow::bail!("{} cannot be empty", key.label());
+    }
+    Ok(value.to_string())
+}
+
+fn parse_port(key: ConfigKey, value: &str) -> Result<u16> {
+    let port = value
+        .parse::<u16>()
+        .with_context(|| format!("{} must be a port number", key.label()))?;
+    if port == 0 {
+        anyhow::bail!("{} must be between 1 and 65535", key.label());
+    }
+    Ok(port)
+}
+
+fn parse_bool(key: ConfigKey, value: &str) -> Result<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => anyhow::bail!("{} must be true or false", key.label()),
+    }
+}
+
+#[derive(Serialize)]
+struct PersistedConfig<'a> {
+    websocket: PersistedWebsocket<'a>,
+    qmp: PersistedQmp<'a>,
+    replay: PersistedReplay<'a>,
+    relay: PersistedRelay<'a>,
+    features: PersistedFeatures,
+}
+
+#[derive(Serialize)]
+struct PersistedWebsocket<'a> {
+    host: &'a str,
+    port: u16,
+}
+
+#[derive(Serialize)]
+struct PersistedQmp<'a> {
+    host: &'a str,
+    port: u16,
+}
+
+#[derive(Serialize)]
+struct PersistedReplay<'a> {
+    directory: &'a Path,
+    save: bool,
+    save_all_ticks: bool,
+    uploads: bool,
+}
+
+#[derive(Serialize)]
+struct PersistedRelay<'a> {
+    enabled: bool,
+    base_url: &'a str,
+    room: &'a str,
+}
+
+#[derive(Serialize)]
+struct PersistedFeatures {
+    compute_spawn_parameters_hash: bool,
+}
+
+impl<'a> From<&'a Config> for PersistedConfig<'a> {
+    fn from(config: &'a Config) -> Self {
+        Self {
+            websocket: PersistedWebsocket {
+                host: &config.websocket_host,
+                port: config.websocket_port,
+            },
+            qmp: PersistedQmp {
+                host: &config.qmp_host,
+                port: config.qmp_port,
+            },
+            replay: PersistedReplay {
+                directory: &config.replay_directory,
+                save: config.save_replays,
+                save_all_ticks: config.save_all_ticks,
+                uploads: config.replay_uploads_enabled,
+            },
+            relay: PersistedRelay {
+                enabled: config.ws_relay_enabled,
+                base_url: &config.ws_relay_base_url,
+                room: &config.ws_relay_room,
+            },
+            features: PersistedFeatures {
+                compute_spawn_parameters_hash: config.compute_spawn_parameters_hash,
+            },
         }
     }
 }
@@ -155,7 +403,11 @@ fn candidate_config_paths() -> Vec<PathBuf> {
         paths.push(exe_dir.join("config.toml"));
     }
     if let Some(app_data) = env::var_os("APPDATA") {
-        paths.push(PathBuf::from(app_data).join("xemu-tools-rs").join("config.toml"));
+        paths.push(
+            PathBuf::from(app_data)
+                .join("xemu-tools-rs")
+                .join("config.toml"),
+        );
     }
     paths
 }
@@ -210,8 +462,7 @@ fn apply_file_config(config: &mut Config, file_config: FileConfig, config_dir: &
     if let Some(room) = file_config.relay.room {
         config.ws_relay_room = room;
     }
-    if let Some(compute_spawn_parameters_hash) =
-        file_config.features.compute_spawn_parameters_hash
+    if let Some(compute_spawn_parameters_hash) = file_config.features.compute_spawn_parameters_hash
     {
         config.compute_spawn_parameters_hash = compute_spawn_parameters_hash;
     }
@@ -241,6 +492,7 @@ fn env_bool_override(name: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn example_config_parses() -> Result<()> {
@@ -294,6 +546,30 @@ mod tests {
         assert_eq!(config.ws_relay_base_url, "wss://relay.example.test");
         assert_eq!(config.ws_relay_room, "arena");
         assert!(!config.compute_spawn_parameters_hash);
+        Ok(())
+    }
+
+    #[test]
+    fn config_values_validate_and_persist() -> Result<()> {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let dir = env::temp_dir().join(format!("xemu-tools-config-{unique}"));
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("config.toml");
+        let mut config = Config {
+            source_path: Some(path.clone()),
+            ..Config::default()
+        };
+
+        config.apply_value(ConfigKey::WebsocketPort, "9012")?;
+        config.apply_value(ConfigKey::RelayEnabled, "off")?;
+        assert!(config.apply_value(ConfigKey::QmpPort, "0").is_err());
+        assert!(config.apply_value(ConfigKey::SaveReplays, "maybe").is_err());
+        config.save()?;
+
+        let parsed: FileConfig = toml::from_str(&fs::read_to_string(&path)?)?;
+        assert_eq!(parsed.websocket.port, Some(9012));
+        assert_eq!(parsed.relay.enabled, Some(false));
+        fs::remove_dir_all(dir)?;
         Ok(())
     }
 }
