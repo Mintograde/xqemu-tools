@@ -3088,8 +3088,8 @@ def get_empty_player_meta():
             kills_by_player=defaultdict(int),
             deaths_by_player=defaultdict(int),
             shots_by_tick=defaultdict(int),
-            kills_by_tick=defaultdict(int),
-            deaths_by_tick=defaultdict(int),
+            kills_by_tick=defaultdict(list),
+            deaths_by_tick=defaultdict(list),
             assists_by_tick=defaultdict(int),
             damage_dealt_by_tick=defaultdict(int),
             damage_dealt=0,
@@ -3290,9 +3290,11 @@ def extract_events(old_game_info: dict, new_game_info: dict) -> list:
     if old_game_info['game_engine_running'] and new_game_info['game_engine_running']:
         if len(old_game_info['players']) == len(new_game_info['players']):
             for old_player, new_player in zip(old_game_info['players'], new_game_info['players']):
+                player_object_data = new_player['player_object_data'] or old_player['player_object_data']
+                location = tuple(player_object_data.get(axis) for axis in ('x', 'y', 'z'))
                 if (kills := new_player['kills']) > old_player['kills']:
                     events.append(f'{game_time}: {new_player["name"]} got a kill ({kills})')
-                    game_meta['players'][new_player['player_index']]['kills_by_tick'][game_time] += kills - old_player['kills']
+                    game_meta['players'][new_player['player_index']]['kills_by_tick'][game_time].extend([location] * (kills - old_player['kills']))
                 if (kill_streak := new_player['kill_streak']) > old_player['kill_streak']:
                     game_meta['players'][new_player['player_index']]['streak_by_tick'][game_time] = kill_streak
                     game_meta['players'][new_player['player_index']]['streak_counts_by_amount'][kill_streak] += 1
@@ -3303,7 +3305,7 @@ def extract_events(old_game_info: dict, new_game_info: dict) -> list:
                         game_meta['players'][new_player['player_index']]['multikill_counts_by_amount'][multikill_amount] += 1
                 if (deaths := new_player['deaths']) > old_player['deaths']:
                     events.append(f'{game_time}: {new_player["name"]} died ({deaths})')
-                    game_meta['players'][new_player['player_index']]['deaths_by_tick'][game_time] += deaths - old_player['deaths']
+                    game_meta['players'][new_player['player_index']]['deaths_by_tick'][game_time].extend([location] * (deaths - old_player['deaths']))
 
                     # predict assist
                     # FIXME: not accurate, assists are based on damage table before killing player's damage is applied

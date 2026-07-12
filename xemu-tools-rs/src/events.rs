@@ -16,8 +16,8 @@ pub struct PlayerMeta {
     kills_by_player: BTreeMap<String, i64>,
     deaths_by_player: BTreeMap<String, i64>,
     shots_by_tick: BTreeMap<String, i64>,
-    kills_by_tick: BTreeMap<String, i64>,
-    deaths_by_tick: BTreeMap<String, i64>,
+    kills_by_tick: BTreeMap<String, Vec<[Option<f64>; 3]>>,
+    deaths_by_tick: BTreeMap<String, Vec<[Option<f64>; 3]>>,
     assists_by_tick: BTreeMap<String, i64>,
     damage_dealt_by_tick: BTreeMap<String, f64>,
     damage_dealt: f64,
@@ -312,13 +312,17 @@ impl GameMeta {
         for (old_player, new_player) in old_players.iter().zip(new_players) {
             let player_index = int_field(new_player, "player_index") as usize;
             let player_name = string_field(new_player, "name");
+            let location = player_location(new_player, old_player);
             let meta = self.players.entry(player_index).or_default();
 
             let kills = int_field(new_player, "kills");
             let old_kills = int_field(old_player, "kills");
             if kills > old_kills {
                 events.push(format!("{game_time}: {player_name} got a kill ({kills})"));
-                *meta.kills_by_tick.entry(game_time_key.to_string()).or_default() += kills - old_kills;
+                let locations = meta.kills_by_tick.entry(game_time_key.to_string()).or_default();
+                for _ in old_kills..kills {
+                    locations.push(location);
+                }
             }
 
             let kill_streak = int_field(new_player, "kill_streak");
@@ -356,7 +360,10 @@ impl GameMeta {
             let old_deaths = int_field(old_player, "deaths");
             if deaths > old_deaths {
                 events.push(format!("{game_time}: {player_name} died ({deaths})"));
-                *meta.deaths_by_tick.entry(game_time_key.to_string()).or_default() += deaths - old_deaths;
+                let locations = meta.deaths_by_tick.entry(game_time_key.to_string()).or_default();
+                for _ in old_deaths..deaths {
+                    locations.push(location);
+                }
             }
 
             let assists = int_field(new_player, "assists");
@@ -479,8 +486,8 @@ impl PlayerMeta {
         map.insert("kills_by_player".to_string(), i64_map_to_value(&self.kills_by_player));
         map.insert("deaths_by_player".to_string(), i64_map_to_value(&self.deaths_by_player));
         map.insert("shots_by_tick".to_string(), i64_map_to_value(&self.shots_by_tick));
-        map.insert("kills_by_tick".to_string(), i64_map_to_value(&self.kills_by_tick));
-        map.insert("deaths_by_tick".to_string(), i64_map_to_value(&self.deaths_by_tick));
+        map.insert("kills_by_tick".to_string(), location_vec_map_to_value(&self.kills_by_tick));
+        map.insert("deaths_by_tick".to_string(), location_vec_map_to_value(&self.deaths_by_tick));
         map.insert("assists_by_tick".to_string(), i64_map_to_value(&self.assists_by_tick));
         map.insert(
             "damage_dealt_by_tick".to_string(),
@@ -542,6 +549,14 @@ fn i64_vec_map_to_value(input: &BTreeMap<String, Vec<i64>>) -> Value {
     Value::Object(map)
 }
 
+fn location_vec_map_to_value(input: &BTreeMap<String, Vec<[Option<f64>; 3]>>) -> Value {
+    let mut map = Map::new();
+    for (key, value) in input {
+        map.insert(key.clone(), json!(value));
+    }
+    Value::Object(map)
+}
+
 fn f64_map_to_value(input: &BTreeMap<String, f64>) -> Value {
     let mut map = Map::new();
     for (key, value) in input {
@@ -584,6 +599,14 @@ fn string_field(value: &Value, field: &str) -> String {
 
 fn object_nonempty(value: &Value) -> bool {
     value.as_object().map(|object| !object.is_empty()).unwrap_or(false)
+}
+
+fn player_location(new_player: &Value, old_player: &Value) -> [Option<f64>; 3] {
+    let player_object_data = new_player
+        .get("player_object_data")
+        .filter(|data| object_nonempty(data))
+        .or_else(|| old_player.get("player_object_data"));
+    ["x", "y", "z"].map(|axis| player_object_data.and_then(|data| data.get(axis)).and_then(as_f64))
 }
 
 fn player_name(game_info: &Value, player_index: usize) -> String {
