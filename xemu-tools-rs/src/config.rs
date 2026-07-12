@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
+
+const ROOM_ALPHABET: &[u8] = b"abcdef";
+const ROOM_NAME_LENGTH: usize = 6;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
@@ -32,7 +36,7 @@ impl Default for Config {
             replay_directory: PathBuf::from("./replays"),
             ws_relay_enabled: true,
             ws_relay_base_url: "http://127.0.0.1:8787".to_string(),
-            ws_relay_room: "test-room2".to_string(),
+            ws_relay_room: random_room_name(),
             compute_spawn_parameters_hash: true,
             save_replays: true,
             save_all_ticks: true,
@@ -144,7 +148,7 @@ impl Config {
             self.environment_overrides.push(ConfigKey::RelayBaseUrl);
         }
         if let Ok(value) = env::var("WS_RELAY_ROOM") {
-            self.ws_relay_room = value;
+            self.ws_relay_room = room_name_or_random(&value);
             self.environment_overrides.push(ConfigKey::RelayRoom);
         }
         if let Some(value) = env_bool_override("COMPUTE_SPAWN_PARAMETERS_HASH") {
@@ -249,6 +253,24 @@ fn non_empty(key: ConfigKey, value: &str) -> Result<String> {
         anyhow::bail!("{} cannot be empty", key.label());
     }
     Ok(value.to_string())
+}
+
+fn random_room_name() -> String {
+    Uuid::new_v4()
+        .as_bytes()
+        .iter()
+        .take(ROOM_NAME_LENGTH)
+        .map(|byte| ROOM_ALPHABET[usize::from(*byte) % ROOM_ALPHABET.len()] as char)
+        .collect()
+}
+
+fn room_name_or_random(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        random_room_name()
+    } else {
+        value.to_string()
+    }
 }
 
 fn parse_port(key: ConfigKey, value: &str) -> Result<u16> {
@@ -460,7 +482,7 @@ fn apply_file_config(config: &mut Config, file_config: FileConfig, config_dir: &
         config.ws_relay_base_url = base_url;
     }
     if let Some(room) = file_config.relay.room {
-        config.ws_relay_room = room;
+        config.ws_relay_room = room_name_or_random(&room);
     }
     if let Some(compute_spawn_parameters_hash) = file_config.features.compute_spawn_parameters_hash
     {
@@ -497,6 +519,33 @@ mod tests {
     #[test]
     fn example_config_parses() -> Result<()> {
         let _: FileConfig = toml::from_str(include_str!("../config.example.toml"))?;
+        Ok(())
+    }
+
+    fn assert_random_room_name(room: &str) {
+        assert_eq!(room.len(), ROOM_NAME_LENGTH);
+        assert!(room.bytes().all(|byte| ROOM_ALPHABET.contains(&byte)));
+    }
+
+    #[test]
+    fn missing_relay_room_uses_random_name() -> Result<()> {
+        let file_config: FileConfig = toml::from_str("[relay]\nenabled = true")?;
+        let mut config = Config::default();
+
+        apply_file_config(&mut config, file_config, Path::new("."));
+
+        assert_random_room_name(&config.ws_relay_room);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_relay_room_uses_random_name() -> Result<()> {
+        let file_config: FileConfig = toml::from_str("[relay]\nroom = \"   \"")?;
+        let mut config = Config::default();
+
+        apply_file_config(&mut config, file_config, Path::new("."));
+
+        assert_random_room_name(&config.ws_relay_room);
         Ok(())
     }
 

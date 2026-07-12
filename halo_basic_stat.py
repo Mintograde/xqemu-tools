@@ -2784,7 +2784,6 @@ def handle_game_info_loop():
             network_game_client = game_info.pop('network_game_client', [])
             # objects = game_info.pop('objects', [])  # FIXME: just temporarily removing this for write performance
 
-            # FIXME: PERF: storing game ticks like this uses lots of memory (~1-2MB/s)
             if store_all_ticks:
                 if first_game_tick is None:
                     first_game_tick = game_info
@@ -3722,7 +3721,6 @@ if __name__ == '__main__':
             args=(ws_client_queue,),
             kwargs=dict(
                 host=WS_RELAY_BASE_URL,
-                room='test-room2',
                 buffer_messages=False,
                 compress_messages=True,
                 # include_all_fields=True,

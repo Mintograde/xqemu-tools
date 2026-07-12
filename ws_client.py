@@ -3,6 +3,7 @@ import base64
 import copy
 import datetime
 import json
+import secrets
 import urllib.request
 from queue import Queue, Empty
 import time
@@ -17,7 +18,7 @@ from replay_utils import strip_tick
 
 DEFAULT_SETTINGS = dict(
     host='ws://127.0.0.1:8787',
-    room='test-room',
+    room=None,
     buffer_messages=True,
     compress_messages=True,
     compress_messages_binary=True,
@@ -30,6 +31,17 @@ DEFAULT_SETTINGS = dict(
 
 LIVE_STATUS_TICKS_PER_SECOND = 30
 LIVE_STATUS_TERMINAL_STATUSES = {"postgame", "ended", "stale"}
+ROOM_ALPHABET = "abcdef"
+ROOM_NAME_LENGTH = 6
+
+
+def random_room_name():
+    return "".join(secrets.choice(ROOM_ALPHABET) for _ in range(ROOM_NAME_LENGTH))
+
+
+def resolve_room_name(room):
+    room = str(room).strip() if room is not None else ""
+    return room or random_room_name()
 
 
 class ClientBaseKwargs(TypedDict, total=False):
@@ -441,10 +453,11 @@ async def send_from_queue(
         print("[ws_client] Sender loop finished.")
 
 
-async def run_client(msg_queue: Queue, host: str, room: str, **kwargs: Unpack[ClientKwargs]):
+async def run_client(msg_queue: Queue, host: str, room: str | None, **kwargs: Unpack[ClientKwargs]):
     """
     The main async function that manages the connection and tasks.
     """
+    room = resolve_room_name(room)
     preempt_key = kwargs.get("preempt_key", None)
     always_include_key = kwargs.get("always_include_key", False)
     buffer_messages = kwargs.get("buffer_messages", DEFAULT_SETTINGS["buffer_messages"])
@@ -537,11 +550,12 @@ async def run_client(msg_queue: Queue, host: str, room: str, **kwargs: Unpack[Cl
         await asyncio.sleep(5)
 
 
-def start_client(msg_queue: Queue, host: str = DEFAULT_SETTINGS['host'], room: str = DEFAULT_SETTINGS['room'], **kwargs: Unpack[ClientKwargs]):
+def start_client(msg_queue: Queue, host: str = DEFAULT_SETTINGS['host'], room: str | None = DEFAULT_SETTINGS['room'], **kwargs: Unpack[ClientKwargs]):
     """
     Entry point to be called in a background thread.
     Sets up and runs the asyncio event loop for the websocket client.
     """
+    room = resolve_room_name(room)
     print(f"[ws_client] Thread starting for room '{room}'.")
     try:
         loop = asyncio.new_event_loop()
