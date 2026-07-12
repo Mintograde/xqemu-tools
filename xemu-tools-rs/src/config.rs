@@ -5,8 +5,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-const ROOM_ALPHABET: &[u8] = b"abcdef";
-const ROOM_NAME_LENGTH: usize = 6;
+const ROOM_ADJECTIVES: [&str; 16] = [
+    "bold", "brisk", "calm", "clear", "cool", "fair", "fast", "fresh", "grand", "keen", "light",
+    "quiet", "rapid", "sharp", "swift", "wise",
+];
+const ROOM_NOUNS: [&str; 16] = [
+    "beacon", "canyon", "cedar", "comet", "harbor", "maple", "meadow", "mesa", "orbit", "peak",
+    "river", "signal", "summit", "trail", "valley", "wave",
+];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
@@ -256,12 +262,12 @@ fn non_empty(key: ConfigKey, value: &str) -> Result<String> {
 }
 
 fn random_room_name() -> String {
-    Uuid::new_v4()
-        .as_bytes()
-        .iter()
-        .take(ROOM_NAME_LENGTH)
-        .map(|byte| ROOM_ALPHABET[usize::from(*byte) % ROOM_ALPHABET.len()] as char)
-        .collect()
+    let random = Uuid::new_v4();
+    let bytes = random.as_bytes();
+    let adjective = ROOM_ADJECTIVES[usize::from(bytes[0]) % ROOM_ADJECTIVES.len()];
+    let noun = ROOM_NOUNS[usize::from(bytes[1]) % ROOM_NOUNS.len()];
+    let number = u16::from_le_bytes([bytes[2], bytes[3]]) % 1000;
+    format!("{adjective}-{noun}-{number:03}")
 }
 
 fn room_name_or_random(value: &str) -> String {
@@ -523,8 +529,12 @@ mod tests {
     }
 
     fn assert_random_room_name(room: &str) {
-        assert_eq!(room.len(), ROOM_NAME_LENGTH);
-        assert!(room.bytes().all(|byte| ROOM_ALPHABET.contains(&byte)));
+        let parts = room.split('-').collect::<Vec<_>>();
+        assert_eq!(parts.len(), 3);
+        assert!(ROOM_ADJECTIVES.contains(&parts[0]));
+        assert!(ROOM_NOUNS.contains(&parts[1]));
+        assert_eq!(parts[2].len(), 3);
+        assert!(parts[2].bytes().all(|byte| byte.is_ascii_digit()));
     }
 
     #[test]

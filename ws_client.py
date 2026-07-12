@@ -31,12 +31,20 @@ DEFAULT_SETTINGS = dict(
 
 LIVE_STATUS_TICKS_PER_SECOND = 30
 LIVE_STATUS_TERMINAL_STATUSES = {"postgame", "ended", "stale"}
-ROOM_ALPHABET = "abcdef"
-ROOM_NAME_LENGTH = 6
+ROOM_ADJECTIVES = (
+    "bold", "brisk", "calm", "clear", "cool", "fair", "fast", "fresh",
+    "grand", "keen", "light", "quiet", "rapid", "sharp", "swift", "wise",
+)
+ROOM_NOUNS = (
+    "beacon", "canyon", "cedar", "comet", "harbor", "maple", "meadow", "mesa",
+    "orbit", "peak", "river", "signal", "summit", "trail", "valley", "wave",
+)
 
 
 def random_room_name():
-    return "".join(secrets.choice(ROOM_ALPHABET) for _ in range(ROOM_NAME_LENGTH))
+    adjective = secrets.choice(ROOM_ADJECTIVES)
+    noun = secrets.choice(ROOM_NOUNS)
+    return f"{adjective}-{noun}-{secrets.randbelow(1000):03d}"
 
 
 def resolve_room_name(room):
