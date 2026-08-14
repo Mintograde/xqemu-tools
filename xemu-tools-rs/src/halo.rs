@@ -26,20 +26,8 @@ struct HaloGlobals {
     game_time_address: u32,
 }
 
-pub struct HaloReader {
-    pub mem: MemoryReader,
-    config: Config,
-    globals: HaloGlobals,
-    spawns_cache: Vec<Value>,
-    items_cache: Vec<Value>,
-    last_game_connection: Value,
-    last_game_in_progress: (u8, u8, u8),
-    pub game_meta: GameMeta,
-    object_type_string_cache: HashMap<u8, String>,
-}
-
-impl HaloReader {
-    pub fn new(mut mem: MemoryReader, config: Config) -> Result<Self> {
+impl HaloGlobals {
+    fn read(mem: &mut MemoryReader) -> Result<Self> {
         let player_datum_array = mem.read_u32(0x2FAD28)?;
         let _player_datum_array_max_count = mem.read_u16(player_datum_array as u64 + 0x20)?;
         let player_datum_array_element_size = mem.read_u16(player_datum_array as u64 + 0x22)?;
@@ -61,19 +49,39 @@ impl HaloReader {
         let game_time_address = game_time_globals_address + 12;
 
         Ok(Self {
+            player_datum_array,
+            player_datum_array_element_size,
+            player_datum_array_first_element_address,
+            players_globals_address,
+            game_globals_address,
+            game_connection_address,
+            game_time_globals_address,
+            global_tag_instances_address,
+            game_time_address,
+        })
+    }
+}
+
+pub struct HaloReader {
+    pub mem: MemoryReader,
+    config: Config,
+    globals: HaloGlobals,
+    spawns_cache: Vec<Value>,
+    items_cache: Vec<Value>,
+    last_game_connection: Value,
+    last_game_in_progress: (u8, u8, u8),
+    pub game_meta: GameMeta,
+    object_type_string_cache: HashMap<u8, String>,
+}
+
+impl HaloReader {
+    pub fn new(mut mem: MemoryReader, config: Config) -> Result<Self> {
+        let globals = HaloGlobals::read(&mut mem)?;
+
+        Ok(Self {
             mem,
             config,
-            globals: HaloGlobals {
-                player_datum_array,
-                player_datum_array_element_size,
-                player_datum_array_first_element_address,
-                players_globals_address,
-                game_globals_address,
-                game_connection_address,
-                game_time_globals_address,
-                global_tag_instances_address,
-                game_time_address,
-            },
+            globals,
             spawns_cache: Vec::new(),
             items_cache: Vec::new(),
             last_game_connection: Value::String(String::new()),
@@ -105,6 +113,8 @@ impl HaloReader {
     }
 
     pub fn get_game_info(&mut self) -> Result<Value> {
+        self.globals = HaloGlobals::read(&mut self.mem)?;
+
         let player_count = self.mem.read_u16(self.globals.player_datum_array as u64 + 0x2E)?;
         let mut player_stat_array = Vec::new();
         let mut damage_counts = Map::new();

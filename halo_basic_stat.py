@@ -396,7 +396,7 @@ def populate_memory_cache():
 
     # spawns from tags cache
     global_scenario_address = read_u32(0x39BE5C)
-    first_spawn_address = read_s32(global_scenario_address + 856)
+    first_spawn_address = read_u32(global_scenario_address + 856)
     if first_spawn_address:
         spawn_count = read_s32(global_scenario_address + 852)
         add_to_cache(first_spawn_address, 52 * spawn_count)
@@ -755,34 +755,31 @@ def get_formatted_bytes(address, length, columns=32):
     data_string = [data.hex(' ')[i:i+3*columns].strip() for i in range(0, len(data.hex(' ')), 3*columns)]
     return data_string
 
-
-# FIXME: qmp lookups outside functions
-player_datum_array = read_u32(0x2FAD28)
-player_datum_array_max_count = read_u16(player_datum_array + 0x20)
-player_datum_array_element_size = read_u16(player_datum_array + 0x22)
-player_datum_array_first_element_address = read_u32(player_datum_array + 0x34)
-
-players_globals_address = read_u32(0x2FAD20)
-teams_address = read_u32(0x2FAD24)
-game_globals_address = read_u32(0x27629C)
-global_game_globals_address = read_u32(0x39BE4C)
-game_server_address = read_u32(0x2E3628)
-game_client_address = read_u32(0x2E362C)
-# game_connection_word = read_u16(0x2E3684)
-game_connection_address = 0x2E3684
-is_team_game_address = read_u8(0x2F90C4)
 game_time_globals_address = read_u32(0x2F8CA0)
-global_tag_instances_address = read_u32(0x39CE24)
-# game_globals_276_108 = read_u16(game_globals_address + 108)
-hud_messages_pointer = read_u32(0x276B40)
 
-# network game server
-# total_players = read_u16(game_server_address + 0x224)
-# max_players = read_u16(game_server_address + 0x10E)
-# print('total players: {}'.format(total_players))
-# print('max players: {}'.format(max_players))
+def update_globals():
 
-something_saying_main_menu = read_u32(0x2E4000 + 4)
+    # FIXME: don't do this every tick, do this just when we need to
+    #        this was a workaround for halo perf build menu transition to ingame
+    global player_datum_array,player_datum_array_max_count,player_datum_array_element_size,player_datum_array_first_element_address
+    global players_globals_address,teams_address,game_globals_address,global_game_globals_address,game_server_address,game_client_address
+    global game_connection_address,is_team_game_address,global_tag_instances_address,hud_messages_pointer
+    global something_saying_main_menu
+    player_datum_array = read_u32(0x2FAD28)
+    player_datum_array_max_count = read_u16(player_datum_array + 0x20)
+    player_datum_array_element_size = read_u16(player_datum_array + 0x22)
+    player_datum_array_first_element_address = read_u32(player_datum_array + 0x34)
+    players_globals_address = read_u32(0x2FAD20)
+    teams_address = read_u32(0x2FAD24)
+    game_globals_address = read_u32(0x27629C)
+    global_game_globals_address = read_u32(0x39BE4C)
+    game_server_address = read_u32(0x2E3628)
+    game_client_address = read_u32(0x2E362C)
+    game_connection_address = 0x2E3684
+    is_team_game_address = read_u8(0x2F90C4)
+    global_tag_instances_address = read_u32(0x39CE24)
+    hud_messages_pointer = read_u32(0x276B40)
+    something_saying_main_menu = read_u32(0x2E4000 + 4)
 
 spawns_cache = []
 
@@ -1924,6 +1921,8 @@ def get_map_info():
 
 
 def get_game_info():
+
+    update_globals()
 
     # FIXME: also support campaign (e.g. prisoner bots)
     #        currently fails when getting gametype for score
