@@ -119,6 +119,16 @@ necessary_fields_live.update(dict(
     items=necessary_fields['items'].copy(),
     gametype_settings=necessary_fields['gametype_settings'].copy(),
     network_game_client=necessary_fields['network_game_client'].copy(),
+    game_meta=dict(
+        players={
+            '*': dict(
+                damage_dealt={},
+                damage_received={},
+                kills_by_tick={},
+                deaths_by_tick={},
+            ),
+        },
+    ),
 ))
 
 necessary_fields_dotted = [

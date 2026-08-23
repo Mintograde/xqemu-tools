@@ -4,7 +4,7 @@ use super::app::{Modal, TuiApp, View};
 use crate::config::ConfigKey;
 use crate::runtime::{
     CommandPhase, CommandRecord, Health, LogLevel, PipelineEdge, PipelineEdgeSnapshot,
-    RuntimeSnapshot, UploadPhase,
+    RuntimeSnapshot, UpdatePhase, UploadPhase,
 };
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -18,7 +18,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut TuiApp, snapshot: &RuntimeSn
     let area = frame.area();
     if area.width < 52 || area.height < 16 {
         draw_compact(frame, area, snapshot);
-        draw_modal(frame, area, app.modal);
+        draw_modal(frame, area, app.modal, snapshot);
         draw_setting_editor(frame, area, app);
         return;
     }
@@ -46,7 +46,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut TuiApp, snapshot: &RuntimeSn
         View::Settings => draw_settings(frame, vertical[2], app, snapshot),
     }
     draw_footer(frame, vertical[3], app, snapshot);
-    draw_modal(frame, area, app.modal);
+    draw_modal(frame, area, app.modal, snapshot);
     draw_setting_editor(frame, area, app);
 }
 
@@ -59,7 +59,7 @@ fn draw_compact(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
     let text = vec![
         Line::from(vec![
             Span::styled(
-                "xemu-tools-rs ",
+                format!("xemu-tools-rs v{} ", snapshot.status.update.current_version),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -95,23 +95,35 @@ fn draw_compact(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
 fn draw_header(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
     let main = &snapshot.status.main;
     let overall = overall_health(snapshot);
-    let text = vec![
-        Line::from(vec![
+    let mut title = vec![
+        Span::styled(
+            format!("xemu-tools-rs v{}", snapshot.status.update.current_version),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(health_label(overall), health_style(overall)),
+        Span::raw(format!(
+            "  uptime {}  tick {}  map {}",
+            format_duration(snapshot.uptime),
+            main.game_time,
+            empty_dash(&main.map_name)
+        )),
+    ];
+    if snapshot.status.update.phase == UpdatePhase::Available {
+        title.extend([
+            Span::raw("  "),
             Span::styled(
-                "xemu-tools-rs",
+                format!("UPDATE v{} (U)", snapshot.status.update.latest_version),
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("  "),
-            Span::styled(health_label(overall), health_style(overall)),
-            Span::raw(format!(
-                "  uptime {}  tick {}  map {}",
-                format_duration(snapshot.uptime),
-                main.game_time,
-                empty_dash(&main.map_name)
-            )),
-        ]),
+        ]);
+    }
+    let text = vec![
+        Line::from(title),
         Line::from(format!(
             "game {}  status {}  players {}  events {}  last tick {}",
             empty_dash(&main.game_id),
@@ -220,7 +232,14 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, snapshot: &Runti
         ]),
         _ => {}
     }
-    spans.extend([key("q"), Span::raw(" quit  "), key("?"), Span::raw(" help")]);
+    spans.extend([
+        key("U"),
+        Span::raw(" update  "),
+        key("q"),
+        Span::raw(" quit  "),
+        key("?"),
+        Span::raw(" help"),
+    ]);
     let latest = snapshot
         .commands
         .last()
@@ -235,7 +254,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, snapshot: &Runti
     );
 }
 
-fn draw_modal(frame: &mut Frame<'_>, area: Rect, modal: Option<Modal>) {
+fn draw_modal(frame: &mut Frame<'_>, area: Rect, modal: Option<Modal>, snapshot: &RuntimeSnapshot) {
     let Some(modal) = modal else {
         return;
     };
@@ -255,6 +274,7 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, modal: Option<Modal>) {
                 Line::from("Enter/e                  edit selected setting"),
                 Line::from("p/d                      retry/cancel selected upload"),
                 Line::from("c                        clear logs"),
+                Line::from("U                        check/install application update"),
                 Line::from("q                        confirm shutdown"),
                 Line::from("Ctrl+C                   immediate shutdown request"),
                 Line::from("Esc, Enter, or ?         close this help"),
@@ -288,6 +308,25 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, modal: Option<Modal>) {
                 ]),
             ],
         ),
+        Modal::InstallUpdate => (
+            centered_rect(area, 62, 9),
+            "Install Signed Update",
+            vec![
+                Line::from(format!(
+                    "Update xemu-tools-rs {} to {}?",
+                    snapshot.status.update.current_version, snapshot.status.update.latest_version
+                )),
+                Line::from("The download will be signature-verified before replacement."),
+                Line::from("The application will shut down and restart when complete."),
+                Line::from(""),
+                Line::from(vec![
+                    key("y / Enter"),
+                    Span::raw(" install    "),
+                    key("n / Esc"),
+                    Span::raw(" cancel"),
+                ]),
+            ],
+        ),
     };
     frame.render_widget(Clear, modal_area);
     frame.render_widget(
@@ -297,6 +336,29 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, modal: Option<Modal>) {
             .wrap(Wrap { trim: false }),
         modal_area,
     );
+}
+
+fn update_phase_label(phase: UpdatePhase) -> &'static str {
+    match phase {
+        UpdatePhase::Disabled => "disabled",
+        UpdatePhase::Idle => "idle",
+        UpdatePhase::Checking => "checking",
+        UpdatePhase::UpToDate => "up to date",
+        UpdatePhase::Available => "available",
+        UpdatePhase::Installing => "installing",
+        UpdatePhase::Installed => "installed",
+        UpdatePhase::Error => "error",
+    }
+}
+
+fn update_phase_style(phase: UpdatePhase) -> Style {
+    match phase {
+        UpdatePhase::Available => Style::default().fg(Color::Yellow),
+        UpdatePhase::Installing | UpdatePhase::Checking => Style::default().fg(Color::Cyan),
+        UpdatePhase::UpToDate | UpdatePhase::Installed => Style::default().fg(Color::Green),
+        UpdatePhase::Error => Style::default().fg(Color::Red),
+        UpdatePhase::Disabled | UpdatePhase::Idle => Style::default().fg(Color::DarkGray),
+    }
 }
 
 fn draw_setting_editor(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {

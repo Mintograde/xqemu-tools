@@ -1,5 +1,5 @@
 use crate::config::ConfigKey;
-use crate::runtime::{AppCommand, LogLevel, LogLine, PipelineEdge, RuntimeSnapshot};
+use crate::runtime::{AppCommand, LogLevel, LogLine, PipelineEdge, RuntimeSnapshot, UpdatePhase};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -51,6 +51,7 @@ pub enum Modal {
     Help,
     Quit,
     DiscardReplay,
+    InstallUpdate,
 }
 
 #[derive(Clone, Debug)]
@@ -243,6 +244,11 @@ impl TuiApp {
             KeyCode::Char('D') if self.view == View::Replay => {
                 self.modal = Some(Modal::DiscardReplay)
             }
+            KeyCode::Char('U') => match snapshot.status.update.phase {
+                UpdatePhase::Available => self.modal = Some(Modal::InstallUpdate),
+                UpdatePhase::Checking | UpdatePhase::Installing | UpdatePhase::Installed => {}
+                _ => return UiAction::Command(AppCommand::CheckForUpdates),
+            },
             KeyCode::Right | KeyCode::Tab | KeyCode::Char('l') => self.change_view(1),
             KeyCode::Left | KeyCode::BackTab | KeyCode::Char('h') => self.change_view(-1),
             KeyCode::Char(value @ '1'..='8') => {
@@ -439,6 +445,14 @@ impl TuiApp {
                 KeyCode::Char('n') | KeyCode::Esc => self.modal = None,
                 _ => {}
             },
+            Modal::InstallUpdate => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    self.modal = None;
+                    return UiAction::Command(AppCommand::InstallUpdate);
+                }
+                KeyCode::Char('n') | KeyCode::Esc => self.modal = None,
+                _ => {}
+            },
         }
         UiAction::None
     }
@@ -537,6 +551,37 @@ mod tests {
         assert!(matches!(
             app.handle_key(key(KeyCode::Char('y')), &snapshot),
             UiAction::Shutdown
+        ));
+    }
+
+    #[test]
+    fn available_update_requires_confirmation_before_install() {
+        let runtime = RuntimeState::new(Config::default());
+        runtime.update(|status| {
+            status.update.phase = UpdatePhase::Available;
+            status.update.latest_version = "0.2.0".to_string();
+        });
+        let snapshot = runtime.snapshot();
+        let mut app = TuiApp::default();
+
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('U')), &snapshot),
+            UiAction::None
+        ));
+        assert_eq!(app.modal, Some(Modal::InstallUpdate));
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('y')), &snapshot),
+            UiAction::Command(AppCommand::InstallUpdate)
+        ));
+    }
+
+    #[test]
+    fn update_shortcut_checks_when_no_release_is_available() {
+        let snapshot = RuntimeState::new(Config::default()).snapshot();
+        let mut app = TuiApp::default();
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('U')), &snapshot),
+            UiAction::Command(AppCommand::CheckForUpdates)
         ));
     }
 

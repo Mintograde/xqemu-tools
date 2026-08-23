@@ -7,10 +7,11 @@ mod qmp;
 mod replay;
 mod runtime;
 mod tui;
+mod update;
 mod util;
 mod ws;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use config::{Config, ConfigKey};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use halo::HaloReader;
@@ -31,13 +32,26 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
 
 fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let relaunch_executable = std::env::current_exe().ok();
+    let relaunch_arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     let config = Config::load()?;
     let runtime = RuntimeState::new(config.clone());
     let (command_tx, command_rx) = unbounded();
-    let _tui = tui::start_tui(runtime.clone(), command_tx);
+    let (update_tx, update_rx) = unbounded();
+    let update_worker = update::start_update_worker(config.clone(), update_rx, runtime.clone());
+    let tui = tui::start_tui(runtime.clone(), command_tx);
     runtime.log("main", "starting runtime");
-    let Some(mut halo) = connect_halo(&config, &runtime, &command_rx)? else {
-        return Ok(());
+    let mut halo = match connect_halo(&config, &runtime, &command_rx, &update_tx) {
+        Ok(Some(halo)) => halo,
+        Ok(None) => {
+            finish_background_workers(&runtime, tui, update_worker, None, Vec::new());
+            relaunch_if_requested(&runtime, relaunch_executable, &relaunch_arguments)?;
+            return Ok(());
+        }
+        Err(err) => {
+            finish_background_workers(&runtime, tui, update_worker, None, Vec::new());
+            return Err(err);
+        }
     };
 
     let (replay_tx, replay_rx) = unbounded();
@@ -46,8 +60,8 @@ fn main() -> Result<()> {
     let (relay_command_tx, relay_command_rx) = unbounded();
     let replay_worker =
         replay::start_replay_worker(config.clone(), replay_rx, relay_tx.clone(), runtime.clone());
-    let _local_ws_server = ws::start_local_ws_server(config.clone(), local_ws_rx, runtime.clone());
-    let _relay_client = if config.ws_relay_enabled {
+    let local_ws_server = ws::start_local_ws_server(config.clone(), local_ws_rx, runtime.clone());
+    let relay_client = if config.ws_relay_enabled {
         Some(ws::start_relay_client(
             config.clone(),
             relay_rx,
@@ -71,19 +85,69 @@ fn main() -> Result<()> {
         relay_tx,
         command_rx,
         relay_command_tx,
+        update_tx,
         runtime.clone(),
     );
+    let mut network_workers = vec![local_ws_server];
+    if let Some(relay_client) = relay_client {
+        network_workers.push(relay_client);
+    }
+    finish_background_workers(
+        &runtime,
+        tui,
+        update_worker,
+        Some(replay_worker),
+        network_workers,
+    );
+    relaunch_if_requested(&runtime, relaunch_executable, &relaunch_arguments)?;
+    main_result
+}
+
+fn finish_background_workers(
+    runtime: &SharedRuntime,
+    tui: std::thread::JoinHandle<()>,
+    update_worker: std::thread::JoinHandle<()>,
+    replay_worker: Option<std::thread::JoinHandle<()>>,
+    network_workers: Vec<std::thread::JoinHandle<()>>,
+) {
     runtime.request_shutdown();
-    if replay_worker.join().is_err() {
+    if replay_worker.is_some_and(|worker| worker.join().is_err()) {
         runtime.log("replay", "worker panicked during shutdown");
     }
-    main_result
+    if update_worker.join().is_err() {
+        runtime.log("update", "worker panicked during shutdown");
+    }
+    for worker in network_workers {
+        if worker.join().is_err() {
+            runtime.log("network", "worker panicked during shutdown");
+        }
+    }
+    if tui.join().is_err() {
+        runtime.log("tui", "worker panicked during shutdown");
+    }
+}
+
+fn relaunch_if_requested(
+    runtime: &SharedRuntime,
+    executable: Option<std::path::PathBuf>,
+    arguments: &[std::ffi::OsString],
+) -> Result<()> {
+    if !runtime.restart_requested() {
+        return Ok(());
+    }
+    let executable = executable.context("cannot restart because the executable path is unknown")?;
+    std::process::Command::new(&executable)
+        .args(arguments)
+        .spawn()
+        .with_context(|| format!("failed to restart {}", executable.display()))?;
+    Ok(())
 }
 
 fn connect_halo(
     config: &Config,
     runtime: &SharedRuntime,
     command_rx: &Receiver<CommandRequest>,
+    update_tx: &Sender<CommandRequest>,
 ) -> Result<Option<HaloReader>> {
     runtime.update(|status| {
         status.xemu.health = Health::Starting;
@@ -92,7 +156,7 @@ fn connect_halo(
     });
     runtime.log("xemu", "waiting for xemu.exe");
     let xemu = loop {
-        if process_connect_commands(command_rx, runtime) {
+        if process_connect_commands(command_rx, update_tx, runtime) {
             return Ok(None);
         }
         if let Some(process) = process::find_xemu_process() {
@@ -121,7 +185,7 @@ fn connect_halo(
     });
     let qmp =
         match QmpClient::connect_with_retry_until(config.qmp_host.clone(), config.qmp_port, || {
-            process_connect_commands(command_rx, runtime)
+            process_connect_commands(command_rx, update_tx, runtime)
         }) {
             Ok(Some(qmp)) => {
                 runtime.update(|status| {
@@ -162,10 +226,18 @@ fn connect_halo(
 
 fn process_connect_commands(
     command_rx: &Receiver<CommandRequest>,
+    update_tx: &Sender<CommandRequest>,
     runtime: &SharedRuntime,
 ) -> bool {
     let mut shutdown = false;
     while let Ok(request) = command_rx.try_recv() {
+        if matches!(
+            &request.command,
+            AppCommand::CheckForUpdates | AppCommand::InstallUpdate
+        ) {
+            forward_update_command(request, update_tx, runtime);
+            continue;
+        }
         runtime.start_command(request.id);
         if matches!(request.command, AppCommand::Shutdown) {
             runtime.request_shutdown();
@@ -179,7 +251,18 @@ fn process_connect_commands(
             );
         }
     }
-    shutdown
+    shutdown || runtime.shutdown_requested()
+}
+
+fn forward_update_command(
+    request: CommandRequest,
+    update_tx: &Sender<CommandRequest>,
+    runtime: &SharedRuntime,
+) {
+    let command_id = request.id;
+    if update_tx.send(request).is_err() {
+        runtime.fail_command(command_id, "update worker is not available");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -191,6 +274,7 @@ fn main_loop(
     relay_tx: Sender<Value>,
     command_rx: Receiver<CommandRequest>,
     relay_command_tx: Sender<RelayCommand>,
+    update_tx: Sender<CommandRequest>,
     runtime: SharedRuntime,
 ) -> Result<()> {
     let mut counter = 0u64;
@@ -206,12 +290,16 @@ fn main_loop(
     let mut resource_sampler = ProcessResourceSampler::new();
 
     loop {
+        if runtime.shutdown_requested() {
+            return Ok(());
+        }
         if process_commands(
             config,
             halo,
             &mut last_game_time,
             &command_rx,
             &relay_command_tx,
+            &update_tx,
             &runtime,
         )? {
             return Ok(());
@@ -276,9 +364,17 @@ fn process_commands(
     last_game_time: &mut Option<i64>,
     command_rx: &Receiver<CommandRequest>,
     relay_command_tx: &Sender<RelayCommand>,
+    update_tx: &Sender<CommandRequest>,
     runtime: &SharedRuntime,
 ) -> Result<bool> {
     while let Ok(request) = command_rx.try_recv() {
+        if matches!(
+            &request.command,
+            AppCommand::CheckForUpdates | AppCommand::InstallUpdate
+        ) {
+            forward_update_command(request, update_tx, runtime);
+            continue;
+        }
         let command_id = request.id;
         runtime.start_command(command_id);
         match request.command {
@@ -301,7 +397,7 @@ fn process_commands(
             }
             AppCommand::ReconnectXemu => {
                 runtime.log("xemu", "manual full reconnect requested");
-                match connect_halo(config, runtime, command_rx) {
+                match connect_halo(config, runtime, command_rx, update_tx) {
                     Ok(Some(new_halo)) => {
                         *halo = new_halo;
                         *last_game_time = None;
@@ -448,9 +544,10 @@ fn process_commands(
                 runtime.request_replay_discard();
                 runtime.finish_command(command_id, "replay discard requested");
             }
+            AppCommand::CheckForUpdates | AppCommand::InstallUpdate => unreachable!(),
         }
     }
-    Ok(false)
+    Ok(runtime.shutdown_requested())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -978,13 +1075,38 @@ mod tests {
     fn shutdown_is_processed_while_waiting_for_connections() {
         let runtime = RuntimeState::new(Config::default());
         let (sender, receiver) = unbounded();
+        let (update_sender, _update_receiver) = unbounded();
         let request = runtime.queue_command(AppCommand::Shutdown);
         sender.send(request).unwrap();
 
-        assert!(process_connect_commands(&receiver, &runtime));
+        assert!(process_connect_commands(
+            &receiver,
+            &update_sender,
+            &runtime
+        ));
         let snapshot = runtime.snapshot();
         assert_eq!(snapshot.commands[0].phase, CommandPhase::Succeeded);
         assert!(runtime.shutdown_requested());
+    }
+
+    #[test]
+    fn update_commands_are_available_while_waiting_for_connections() {
+        let runtime = RuntimeState::new(Config::default());
+        let (sender, receiver) = unbounded();
+        let (update_sender, update_receiver) = unbounded();
+        let request = runtime.queue_command(AppCommand::CheckForUpdates);
+        let command_id = request.id;
+        sender.send(request).unwrap();
+
+        assert!(!process_connect_commands(
+            &receiver,
+            &update_sender,
+            &runtime
+        ));
+        let forwarded = update_receiver.try_recv().unwrap();
+        assert_eq!(forwarded.id, command_id);
+        assert!(matches!(forwarded.command, AppCommand::CheckForUpdates));
+        assert_eq!(runtime.snapshot().commands[0].phase, CommandPhase::Queued);
     }
 
     #[test]

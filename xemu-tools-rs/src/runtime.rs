@@ -20,6 +20,7 @@ pub struct RuntimeState {
     next_command_id: AtomicU64,
     next_log_sequence: AtomicU64,
     shutdown_requested: AtomicBool,
+    restart_requested: AtomicBool,
     discard_replay_requested: AtomicBool,
     pub controls: RuntimeControls,
     config: RwLock<Config>,
@@ -40,6 +41,7 @@ impl RuntimeState {
             next_command_id: AtomicU64::new(1),
             next_log_sequence: AtomicU64::new(1),
             shutdown_requested: AtomicBool::new(false),
+            restart_requested: AtomicBool::new(false),
             discard_replay_requested: AtomicBool::new(false),
             active_config: RwLock::new(config.clone()),
             config: RwLock::new(config),
@@ -104,6 +106,15 @@ impl RuntimeState {
 
     pub fn shutdown_requested(&self) -> bool {
         self.shutdown_requested.load(Ordering::Acquire)
+    }
+
+    pub fn request_restart(&self) {
+        self.restart_requested.store(true, Ordering::Release);
+        self.request_shutdown();
+    }
+
+    pub fn restart_requested(&self) -> bool {
+        self.restart_requested.load(Ordering::Acquire)
     }
 
     pub fn request_replay_discard(&self) {
@@ -321,6 +332,8 @@ pub enum AppCommand {
     CancelUpload(String),
     DisconnectClient(String),
     DiscardReplay,
+    CheckForUpdates,
+    InstallUpdate,
 }
 
 impl AppCommand {
@@ -340,6 +353,8 @@ impl AppCommand {
             Self::CancelUpload(_) => "cancel upload",
             Self::DisconnectClient(_) => "disconnect client",
             Self::DiscardReplay => "discard replay",
+            Self::CheckForUpdates => "check for updates",
+            Self::InstallUpdate => "install update",
         }
     }
 }
@@ -555,6 +570,46 @@ fn activity_age(now: Duration, encoded_millis: u64) -> Option<Duration> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UpdatePhase {
+    Disabled,
+    #[default]
+    Idle,
+    Checking,
+    UpToDate,
+    Available,
+    Installing,
+    Installed,
+    Error,
+}
+
+#[derive(Clone, Debug)]
+pub struct UpdateStatus {
+    pub phase: UpdatePhase,
+    pub current_version: String,
+    pub latest_version: String,
+    pub release_url: String,
+    pub detail: String,
+    pub signature_configured: bool,
+    pub last_checked: Option<Instant>,
+    pub last_error: Option<String>,
+}
+
+impl Default for UpdateStatus {
+    fn default() -> Self {
+        Self {
+            phase: UpdatePhase::Idle,
+            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            latest_version: String::new(),
+            release_url: String::new(),
+            detail: "not checked".to_string(),
+            signature_configured: false,
+            last_checked: None,
+            last_error: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct AppStatus {
     pub xemu: XemuStatus,
@@ -564,6 +619,7 @@ pub struct AppStatus {
     pub replay: ReplayStatus,
     pub main: MainLoopStatus,
     pub game: GameDetailStatus,
+    pub update: UpdateStatus,
     pub logs: Vec<LogLine>,
 }
 

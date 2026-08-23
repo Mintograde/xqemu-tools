@@ -8,9 +8,14 @@ pub(in crate::tui::render) fn draw_settings(
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
+        .constraints([
+            Constraint::Length(7),
+            Constraint::Percentage(50),
+            Constraint::Min(6),
+        ])
         .split(area);
-    let visible = chunks[0].height.saturating_sub(3) as usize;
+    draw_update_status(frame, chunks[0], snapshot);
+    let visible = chunks[1].height.saturating_sub(3) as usize;
     let start = app
         .selected_setting
         .saturating_sub(visible.saturating_sub(1))
@@ -78,9 +83,69 @@ pub(in crate::tui::render) fn draw_settings(
             shorten(&source, 45)
         )))
         .column_spacing(1),
-        chunks[0],
+        chunks[1],
     );
-    draw_command_history(frame, chunks[1], snapshot);
+    draw_command_history(frame, chunks[2], snapshot);
+}
+
+fn draw_update_status(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
+    let update = &snapshot.status.update;
+    let latest = if update.latest_version.is_empty() {
+        "-".to_string()
+    } else {
+        update.latest_version.clone()
+    };
+    let checked = update
+        .last_checked
+        .map(elapsed)
+        .unwrap_or_else(|| "never".to_string());
+    let rows = vec![
+        Row::new(vec![
+            Cell::from("Version"),
+            Cell::from(format!("{} -> {latest}", update.current_version)),
+            Cell::from("Signature"),
+            Cell::from(if update.signature_configured {
+                "configured"
+            } else {
+                "missing; install disabled"
+            })
+            .style(if update.signature_configured {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::Yellow)
+            }),
+        ]),
+        Row::new(vec![
+            Cell::from("State"),
+            Cell::from(update_phase_label(update.phase)).style(update_phase_style(update.phase)),
+            Cell::from("Checked"),
+            Cell::from(checked),
+        ]),
+        Row::new(vec![
+            Cell::from("Detail"),
+            Cell::from(update.detail.clone()),
+            Cell::from("Error"),
+            Cell::from(last_error(&update.last_error)).style(if update.last_error.is_some() {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            }),
+        ]),
+    ];
+    frame.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(9),
+                Constraint::Percentage(33),
+                Constraint::Length(10),
+                Constraint::Min(20),
+            ],
+        )
+        .block(block("Application Update - U check/install"))
+        .column_spacing(1),
+        area,
+    );
 }
 
 fn draw_command_history(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {

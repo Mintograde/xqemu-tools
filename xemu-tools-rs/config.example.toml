@@ -21,3 +21,6 @@ room = ""
 
 [features]
 compute_spawn_parameters_hash = true
+
+[updates]
+enabled = true

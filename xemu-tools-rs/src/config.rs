@@ -28,6 +28,7 @@ pub struct Config {
     pub save_replays: bool,
     pub save_all_ticks: bool,
     pub replay_uploads_enabled: bool,
+    pub update_checks_enabled: bool,
     pub source_path: Option<PathBuf>,
     pub environment_overrides: Vec<ConfigKey>,
 }
@@ -47,6 +48,7 @@ impl Default for Config {
             save_replays: true,
             save_all_ticks: true,
             replay_uploads_enabled: true,
+            update_checks_enabled: true,
             source_path: None,
             environment_overrides: Vec::new(),
         }
@@ -103,6 +105,7 @@ impl Config {
             ConfigKey::SaveReplays => self.save_replays = parse_bool(key, value)?,
             ConfigKey::SaveAllTicks => self.save_all_ticks = parse_bool(key, value)?,
             ConfigKey::ReplayUploads => self.replay_uploads_enabled = parse_bool(key, value)?,
+            ConfigKey::UpdateChecks => self.update_checks_enabled = parse_bool(key, value)?,
         }
         Ok(())
     }
@@ -121,6 +124,7 @@ impl Config {
             ConfigKey::SaveReplays => self.save_replays.to_string(),
             ConfigKey::SaveAllTicks => self.save_all_ticks.to_string(),
             ConfigKey::ReplayUploads => self.replay_uploads_enabled.to_string(),
+            ConfigKey::UpdateChecks => self.update_checks_enabled.to_string(),
         }
     }
 
@@ -173,6 +177,10 @@ impl Config {
             self.replay_uploads_enabled = value;
             self.environment_overrides.push(ConfigKey::ReplayUploads);
         }
+        if let Some(value) = env_bool_override("ENABLE_UPDATE_CHECKS") {
+            self.update_checks_enabled = value;
+            self.environment_overrides.push(ConfigKey::UpdateChecks);
+        }
     }
 
     pub fn origin(&self, key: ConfigKey) -> &'static str {
@@ -200,10 +208,11 @@ pub enum ConfigKey {
     SaveReplays,
     SaveAllTicks,
     ReplayUploads,
+    UpdateChecks,
 }
 
 impl ConfigKey {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::WebsocketHost,
         Self::WebsocketPort,
         Self::QmpHost,
@@ -216,6 +225,7 @@ impl ConfigKey {
         Self::SaveReplays,
         Self::SaveAllTicks,
         Self::ReplayUploads,
+        Self::UpdateChecks,
     ];
 
     pub fn label(self) -> &'static str {
@@ -232,6 +242,7 @@ impl ConfigKey {
             Self::SaveReplays => "save replays",
             Self::SaveAllTicks => "save all ticks",
             Self::ReplayUploads => "replay uploads",
+            Self::UpdateChecks => "update checks",
         }
     }
 
@@ -250,6 +261,7 @@ impl ConfigKey {
                 | Self::SaveReplays
                 | Self::SaveAllTicks
                 | Self::ReplayUploads
+                | Self::UpdateChecks
         )
     }
 }
@@ -304,6 +316,7 @@ struct PersistedConfig<'a> {
     replay: PersistedReplay<'a>,
     relay: PersistedRelay<'a>,
     features: PersistedFeatures,
+    updates: PersistedUpdates,
 }
 
 #[derive(Serialize)]
@@ -338,6 +351,11 @@ struct PersistedFeatures {
     compute_spawn_parameters_hash: bool,
 }
 
+#[derive(Serialize)]
+struct PersistedUpdates {
+    enabled: bool,
+}
+
 impl<'a> From<&'a Config> for PersistedConfig<'a> {
     fn from(config: &'a Config) -> Self {
         Self {
@@ -363,6 +381,9 @@ impl<'a> From<&'a Config> for PersistedConfig<'a> {
             features: PersistedFeatures {
                 compute_spawn_parameters_hash: config.compute_spawn_parameters_hash,
             },
+            updates: PersistedUpdates {
+                enabled: config.update_checks_enabled,
+            },
         }
     }
 }
@@ -375,6 +396,7 @@ struct FileConfig {
     replay: ReplayConfig,
     relay: RelayConfig,
     features: FeatureConfig,
+    updates: UpdateConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -412,6 +434,12 @@ struct RelayConfig {
 #[serde(default)]
 struct FeatureConfig {
     compute_spawn_parameters_hash: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct UpdateConfig {
+    enabled: Option<bool>,
 }
 
 fn find_config_file() -> Option<PathBuf> {
@@ -493,6 +521,9 @@ fn apply_file_config(config: &mut Config, file_config: FileConfig, config_dir: &
     if let Some(compute_spawn_parameters_hash) = file_config.features.compute_spawn_parameters_hash
     {
         config.compute_spawn_parameters_hash = compute_spawn_parameters_hash;
+    }
+    if let Some(enabled) = file_config.updates.enabled {
+        config.update_checks_enabled = enabled;
     }
 }
 

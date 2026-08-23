@@ -53,6 +53,9 @@ fn run_tui_loop(
     let mut snapshot = runtime.snapshot();
     let mut last_draw = Instant::now() - DRAW_INTERVAL;
     loop {
+        if runtime.shutdown_requested() {
+            break;
+        }
         if last_draw.elapsed() >= DRAW_INTERVAL {
             snapshot = runtime.snapshot();
             app.observe(&snapshot);

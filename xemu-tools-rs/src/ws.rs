@@ -142,7 +142,13 @@ async fn run_local_ws_server(
     });
 
     loop {
-        let (stream, address) = listener.accept().await?;
+        let accepted = tokio::select! {
+            result = listener.accept() => Some(result?),
+            _ = wait_for_shutdown(runtime.clone()) => None,
+        };
+        let Some((stream, address)) = accepted else {
+            break;
+        };
         let address_key = address.to_string();
         runtime.update(|status| {
             status.local_ws.client_count += 1;
@@ -168,6 +174,9 @@ async fn run_local_ws_server(
                 Ok(mut ws) => loop {
                     let received = tokio::select! {
                         _ = control_interval.tick() => {
+                            if client_runtime.shutdown_requested() {
+                                break;
+                            }
                             if client_runtime.take_client_disconnect_request(&address_key) {
                                 client_runtime.log(
                                     "local_ws",
@@ -236,6 +245,7 @@ async fn run_local_ws_server(
             client_runtime.log("local_ws", format!("client disconnected {address}"));
         });
     }
+    Ok(())
 }
 
 fn update_local_client(
@@ -279,6 +289,9 @@ async fn run_relay_client(
     }));
 
     loop {
+        if runtime.shutdown_requested() {
+            break;
+        }
         runtime.update(|status| {
             status.relay.health = Health::Starting;
             status.relay.attempts += 1;
@@ -288,7 +301,14 @@ async fn run_relay_client(
         });
         runtime.log("relay", format!("connecting to {uri}"));
         let mut reconnect_requested = false;
-        match connect_async(&uri).await {
+        let connection = tokio::select! {
+            result = connect_async(&uri) => Some(result),
+            _ = wait_for_shutdown(runtime.clone()) => None,
+        };
+        let Some(connection) = connection else {
+            break;
+        };
+        match connection {
             Ok((ws, _response)) => {
                 runtime.update(|status| {
                     status.relay.health = Health::Connected;
@@ -300,7 +320,11 @@ async fn run_relay_client(
                 runtime.log("relay", "connection established");
                 let (mut write, mut read) = ws.split();
                 let (outbound_control_tx, outbound_control_rx) = mpsc::unbounded_channel::<Value>();
-                if let Some(Ok(raw)) = read.next().await {
+                let welcome_message = tokio::select! {
+                    message = read.next() => message,
+                    _ = wait_for_shutdown(runtime.clone()) => break,
+                };
+                if let Some(Ok(raw)) = welcome_message {
                     if let Ok(welcome) = message_to_json(&raw) {
                         if welcome.get("type").and_then(Value::as_str) == Some("welcome")
                             && welcome.get("role").and_then(Value::as_str) == Some("producer")
@@ -406,6 +430,10 @@ async fn run_relay_client(
             }
         }
 
+        if runtime.shutdown_requested() {
+            break;
+        }
+
         let (dropped, retained_upload_request_ids) =
             flush_stale_relay_messages(&receiver, &sender, &runtime);
         if dropped > 0 {
@@ -432,7 +460,17 @@ async fn run_relay_client(
             status.relay.reconnect_backoff_secs = retry_delay.as_secs();
             status.relay.next_reconnect_at = Some(Instant::now() + retry_delay);
         });
-        tokio::time::sleep(retry_delay).await;
+        tokio::select! {
+            _ = tokio::time::sleep(retry_delay) => {}
+            _ = wait_for_shutdown(runtime.clone()) => break,
+        }
+    }
+    Ok(())
+}
+
+async fn wait_for_shutdown(runtime: SharedRuntime) {
+    while !runtime.shutdown_requested() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -913,6 +951,9 @@ where
     let mut terminal_status_sent_for_game_id: Option<String> = None;
 
     loop {
+        if runtime.shutdown_requested() {
+            return Ok(RelayLoopExit::Disconnected);
+        }
         while let Ok(command) = control_receiver.try_recv() {
             match command {
                 RelayCommand::ReconnectNow => return Ok(RelayLoopExit::ReconnectRequested),
@@ -1180,6 +1221,7 @@ fn strip_tick(data: &Value) -> Value {
     copy_field(&mut root, data, "items");
     copy_field(&mut root, data, "gametype_settings");
     copy_network_game_client(&mut root, data);
+    copy_game_meta(&mut root, data);
     Value::Object(root)
 }
 
@@ -1352,6 +1394,36 @@ fn copy_network_game_client(root: &mut Map<String, Value>, data: &Value) {
         );
     }
     root.insert("network_game_client".to_string(), Value::Object(client_map));
+}
+
+fn copy_game_meta(root: &mut Map<String, Value>, data: &Value) {
+    let Some(game_meta) = data.get("game_meta").and_then(Value::as_object) else {
+        return;
+    };
+
+    let mut game_meta_map = Map::new();
+    if let Some(players) = game_meta.get("players").and_then(Value::as_object) {
+        let mut players_map = Map::new();
+        for (player_index, player) in players {
+            let Some(player) = player.as_object() else {
+                continue;
+            };
+            let mut player_map = Map::new();
+            for field in [
+                "damage_dealt",
+                "damage_received",
+                "kills_by_tick",
+                "deaths_by_tick",
+            ] {
+                if let Some(value) = player.get(field) {
+                    player_map.insert(field.to_string(), value.clone());
+                }
+            }
+            players_map.insert(player_index.clone(), Value::Object(player_map));
+        }
+        game_meta_map.insert("players".to_string(), Value::Object(players_map));
+    }
+    root.insert("game_meta".to_string(), Value::Object(game_meta_map));
 }
 
 fn copy_into(target: &mut Map<String, Value>, source: &Value, field: &str) {
@@ -1609,5 +1681,52 @@ mod tests {
         assert_eq!(upload.size_bytes, 1024);
         assert_eq!(upload.attempts, 1);
         assert_eq!(upload.phase, UploadPhase::Uploaded);
+    }
+
+    #[test]
+    fn strip_tick_keeps_selected_game_meta_fields_for_each_player() {
+        let payload = json!({
+            "game_meta": {
+                "start_time": "not retained",
+                "players": {
+                    "0": {
+                        "damage_dealt": 125.5,
+                        "damage_received": 80.0,
+                        "kills_by_tick": {"30": [[1.0, 2.0, 3.0]]},
+                        "deaths_by_tick": {"60": [[4.0, 5.0, 6.0]]},
+                        "shots_by_tick": {"10": 1}
+                    },
+                    "7": {
+                        "damage_dealt": 80.0,
+                        "damage_received": 125.5,
+                        "kills_by_tick": {},
+                        "deaths_by_tick": {"30": [[7.0, 8.0, 9.0]]},
+                        "active_projectiles": ["not retained"]
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            strip_tick(&payload),
+            json!({
+                "game_meta": {
+                    "players": {
+                        "0": {
+                            "damage_dealt": 125.5,
+                            "damage_received": 80.0,
+                            "kills_by_tick": {"30": [[1.0, 2.0, 3.0]]},
+                            "deaths_by_tick": {"60": [[4.0, 5.0, 6.0]]}
+                        },
+                        "7": {
+                            "damage_dealt": 80.0,
+                            "damage_received": 125.5,
+                            "kills_by_tick": {},
+                            "deaths_by_tick": {"30": [[7.0, 8.0, 9.0]]}
+                        }
+                    }
+                }
+            })
+        );
     }
 }
