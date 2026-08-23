@@ -285,7 +285,12 @@ def _strip_json(data, fields):
             return data  # Return the entire dictionary as-is
 
         # Recursively process the dictionary, but skip empty results
-        result = {k: _strip_json(v, fields.get(k, {})) for k, v in data.items() if k in fields}
+        wildcard_fields = fields.get('*')
+        result = {
+            key: _strip_json(value, fields.get(key, wildcard_fields))
+            for key, value in data.items()
+            if key in fields or wildcard_fields is not None
+        }
         # Remove empty dictionaries
         # return {k: v for k, v in result.items() if v != {}}
         return {k: v for k, v in result.items()}
