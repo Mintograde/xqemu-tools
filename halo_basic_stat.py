@@ -3090,6 +3090,7 @@ def get_empty_player_meta():
             kills_by_tick=defaultdict(list),
             deaths_by_tick=defaultdict(list),
             assists_by_tick=defaultdict(int),
+            score_by_tick=defaultdict(int),
             damage_dealt_by_tick=defaultdict(int),
             damage_dealt=0,
             damage_received_by_tick=defaultdict(int),
@@ -3323,6 +3324,10 @@ def extract_events(old_game_info: dict, new_game_info: dict) -> list:
                 if (assists := new_player['assists']) > old_player['assists']:
                     events.append(f'{game_time}: {new_player["name"]} got an assist ({assists})')
                     game_meta['players'][new_player['player_index']]['assists_by_tick'][game_time] += assists - old_player['assists']
+
+                if (score := new_player['score']) > old_player['score']:
+                    events.append(f'{game_time}: {new_player["name"]} scored ({score})')
+                    game_meta['players'][new_player['player_index']]['score_by_tick'][game_time] += score - old_player['score']
 
                 # camo
                 if new_player['derived_stats']['has_camo'] and not old_player['derived_stats']['has_camo']:

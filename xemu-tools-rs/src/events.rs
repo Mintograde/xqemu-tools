@@ -19,6 +19,7 @@ pub struct PlayerMeta {
     kills_by_tick: BTreeMap<String, Vec<[Option<f64>; 3]>>,
     deaths_by_tick: BTreeMap<String, Vec<[Option<f64>; 3]>>,
     assists_by_tick: BTreeMap<String, i64>,
+    score_by_tick: BTreeMap<String, i64>,
     damage_dealt_by_tick: BTreeMap<String, f64>,
     damage_dealt: f64,
     damage_received_by_tick: BTreeMap<String, f64>,
@@ -373,6 +374,13 @@ impl GameMeta {
                 *meta.assists_by_tick.entry(game_time_key.to_string()).or_default() += assists - old_assists;
             }
 
+            let score = int_field(new_player, "score");
+            let old_score = int_field(old_player, "score");
+            if score > old_score {
+                events.push(format!("{game_time}: {player_name} scored ({score})"));
+                *meta.score_by_tick.entry(game_time_key.to_string()).or_default() += score - old_score;
+            }
+
             let has_camo = get_path(new_player, &["derived_stats", "has_camo"])
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
@@ -489,6 +497,7 @@ impl PlayerMeta {
         map.insert("kills_by_tick".to_string(), location_vec_map_to_value(&self.kills_by_tick));
         map.insert("deaths_by_tick".to_string(), location_vec_map_to_value(&self.deaths_by_tick));
         map.insert("assists_by_tick".to_string(), i64_map_to_value(&self.assists_by_tick));
+        map.insert("score_by_tick".to_string(), i64_map_to_value(&self.score_by_tick));
         map.insert(
             "damage_dealt_by_tick".to_string(),
             f64_map_to_value(&self.damage_dealt_by_tick),
@@ -653,4 +662,41 @@ fn matches_gametype(current_gametype: i32, gametype_list: &[i32]) -> bool {
             || (*gametype == 13 && current_gametype != 1)
             || (*gametype == 14 && current_gametype != 1 && current_gametype != 5)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn score_increases_are_recorded_by_tick() {
+        let old_game_info = json!({
+            "game_engine_running": true,
+            "game_engine_can_score": false,
+            "players": [{
+                "player_index": 0,
+                "name": "Player 1",
+                "score": 4
+            }]
+        });
+        let mut new_game_info = json!({
+            "game_engine_running": true,
+            "game_engine_can_score": false,
+            "game_time_info": {"game_time": 30},
+            "players": [{
+                "player_index": 0,
+                "name": "Player 1",
+                "score": 7
+            }]
+        });
+        let mut game_meta = GameMeta::default();
+
+        let result = game_meta.extract_events(&old_game_info, &mut new_game_info);
+
+        assert_eq!(result.events, vec!["30: Player 1 scored (7)"]);
+        assert_eq!(
+            new_game_info["game_meta"]["players"]["0"]["score_by_tick"],
+            json!({"30": 3})
+        );
+    }
 }

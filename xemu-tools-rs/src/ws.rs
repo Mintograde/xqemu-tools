@@ -1414,6 +1414,9 @@ fn copy_game_meta(root: &mut Map<String, Value>, data: &Value) {
                 "damage_received",
                 "kills_by_tick",
                 "deaths_by_tick",
+                "score_by_tick",
+                "camo_count",
+                "overshield_count",
             ] {
                 if let Some(value) = player.get(field) {
                     player_map.insert(field.to_string(), value.clone());
@@ -1694,6 +1697,9 @@ mod tests {
                         "damage_received": 80.0,
                         "kills_by_tick": {"30": [[1.0, 2.0, 3.0]]},
                         "deaths_by_tick": {"60": [[4.0, 5.0, 6.0]]},
+                        "score_by_tick": {"30": 2},
+                        "camo_count": 2,
+                        "overshield_count": 3,
                         "shots_by_tick": {"10": 1}
                     },
                     "7": {
@@ -1701,6 +1707,9 @@ mod tests {
                         "damage_received": 125.5,
                         "kills_by_tick": {},
                         "deaths_by_tick": {"30": [[7.0, 8.0, 9.0]]},
+                        "score_by_tick": {"30": 1},
+                        "camo_count": 1,
+                        "overshield_count": 0,
                         "active_projectiles": ["not retained"]
                     }
                 }
@@ -1716,13 +1725,19 @@ mod tests {
                             "damage_dealt": 125.5,
                             "damage_received": 80.0,
                             "kills_by_tick": {"30": [[1.0, 2.0, 3.0]]},
-                            "deaths_by_tick": {"60": [[4.0, 5.0, 6.0]]}
+                            "deaths_by_tick": {"60": [[4.0, 5.0, 6.0]]},
+                            "score_by_tick": {"30": 2},
+                            "camo_count": 2,
+                            "overshield_count": 3
                         },
                         "7": {
                             "damage_dealt": 80.0,
                             "damage_received": 125.5,
                             "kills_by_tick": {},
-                            "deaths_by_tick": {"30": [[7.0, 8.0, 9.0]]}
+                            "deaths_by_tick": {"30": [[7.0, 8.0, 9.0]]},
+                            "score_by_tick": {"30": 1},
+                            "camo_count": 1,
+                            "overshield_count": 0
                         }
                     }
                 }
