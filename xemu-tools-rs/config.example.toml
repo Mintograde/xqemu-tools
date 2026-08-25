@@ -16,7 +16,7 @@ uploads = true
 
 [relay]
 enabled = true
-base_url = "wss://halospawns-live-relay-dev.mintograde.workers.dev"
+base_url = "wss://halospawns-relay-dev.mintograde.workers.dev"
 room = ""
 
 [features]
