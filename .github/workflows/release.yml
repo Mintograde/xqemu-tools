@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-release-${{ github.ref }}
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  release:
+    needs: build
+    permissions:
+      contents: write
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: xemu-tools-rs
+    env:
+      ARCHIVE: xemu-tools-rs-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip
+      CHECKSUM: xemu-tools-rs-${{ github.ref_name }}-SHA256SUMS.txt
+      RUSTUP_TOOLCHAIN: stable
+      XEMU_TOOLS_UPDATE_VERIFYING_KEY: ${{ vars.UPDATE_VERIFYING_KEY }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download tested executable
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: xemu-tools-rs
+          path: xemu-tools-rs/target/release
+
+      - name: Install compatible archive signer
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          cargo install zipsign --version 0.1.4 --locked
+
+      - name: Package and sign
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          $package = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages |
+            Where-Object name -eq "xemu-tools-rs"
+          if ($null -eq $package -or $env:GITHUB_REF_NAME -ne "v$($package.version)") {
+            throw "tag must match the xemu-tools-rs Cargo.toml version"
+          }
+
+          $privateBytes = [Convert]::FromBase64String($env:UPDATE_SIGNING_KEY)
+          $publicBytes = [Convert]::FromBase64String($env:XEMU_TOOLS_UPDATE_VERIFYING_KEY)
+          if ($privateBytes.Length -ne 64 -or $publicBytes.Length -ne 32) {
+            throw "invalid update signing key sizes"
+          }
+
+          $files = @("target\release\xemu-tools-rs.exe", "config.example.toml")
+          Compress-Archive -LiteralPath $files -DestinationPath $env:ARCHIVE
+
+          $privateKey = Join-Path $env:RUNNER_TEMP "update-private.key"
+          $publicKey = Join-Path $env:RUNNER_TEMP "update-public.key"
+          try {
+            [IO.File]::WriteAllBytes($privateKey, $privateBytes)
+            [IO.File]::WriteAllBytes($publicKey, $publicBytes)
+            zipsign sign zip $env:ARCHIVE $privateKey
+            if ($LASTEXITCODE -ne 0) { throw "archive signing failed" }
+            zipsign verify zip $env:ARCHIVE $publicKey
+            if ($LASTEXITCODE -ne 0) { throw "signature verification failed" }
+          } finally {
+            Remove-Item -LiteralPath $privateKey, $publicKey -Force -ErrorAction SilentlyContinue
+          }
+
+          $hash = (Get-FileHash -Algorithm SHA256 $env:ARCHIVE).Hash.ToLowerInvariant()
+          "$hash  $env:ARCHIVE" | Set-Content -NoNewline $env:CHECKSUM
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $arguments = @(
+            "release", "create", $env:GITHUB_REF_NAME, $env:ARCHIVE, $env:CHECKSUM,
+            "--repo", $env:GITHUB_REPOSITORY, "--verify-tag", "--generate-notes",
+            "--title", "xemu-tools-rs $env:GITHUB_REF_NAME"
+          )
+          if ($env:GITHUB_REF_NAME.Contains("-")) { $arguments += "--prerelease" }
+          gh @arguments
