@@ -1329,6 +1329,8 @@ fn copy_objects(root: &mut Map<String, Value>, data: &Value) {
         let mut map = Map::new();
         for field in [
             "object_id",
+            "flags",
+            "state_flags",
             "x",
             "y",
             "z",

@@ -95,6 +95,8 @@ necessary_fields = dict(
         ),
         objects=dict(
             object_id={},
+            flags={},
+            state_flags={},
             x={},
             y={},
             z={},
