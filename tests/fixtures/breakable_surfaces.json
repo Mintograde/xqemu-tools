@@ -1,0 +1,11 @@
+{
+  "cases": [
+    {"name":"all_intact","destroyed_ids":[],"snapshot":0},
+    {"name":"pane_zero","destroyed_ids":[0],"snapshot":1},
+    {"name":"pane_one","destroyed_ids":[1],"snapshot":2},
+    {"name":"both_panes","destroyed_ids":[0,1],"snapshot":3},
+    {"name":"byte_boundaries","destroyed_ids":[0,7,8,15,16,31],"snapshot":2147582337},
+    {"name":"highest_id","destroyed_ids":[31],"snapshot":2147483648},
+    {"name":"all_broken","destroyed_ids":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31],"snapshot":4294967295}
+  ]
+}
