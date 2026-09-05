@@ -677,6 +677,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn final_replay_preserves_complete_breakable_snapshots_and_unknown() -> Result<()> {
+        let fixture: Value = serde_json::from_str(include_str!("../../tests/fixtures/breakable_surfaces.json"))?;
+        let dir = test_dir()?;
+        let out_path = dir.join("breakable.json.zst");
+        let mut spool = TickSpool::new(&dir, "breakable")?;
+        let mut ticks = Vec::new();
+        for (index, snapshot) in fixture["cases"].as_array().unwrap().iter()
+            .map(|case| case["snapshot"].clone()).chain([Value::Null]).enumerate() {
+            let tick = json!({"game_time_info": {"game_time": 100 + index * 10}, "broken_surfaces": snapshot});
+            spool.push_tick(&tick)?;
+            ticks.push(tick);
+        }
+        let finished = spool.finish()?;
+        write_final_replay_file(&out_path, &TestReplayValues::new().parts(), Some(&finished))?;
+        let replay: Value = serde_json::from_slice(&zstd::stream::decode_all(File::open(out_path)?)?)?;
+        assert_eq!(replay["ticks"], json!(ticks));
+        drop(finished);
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn streamed_replay_matches_existing_serialized_json_with_spooled_ticks() -> Result<()> {
         let dir = test_dir()?;
         let out_path = dir.join("replay.json.zst");

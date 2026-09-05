@@ -580,6 +580,12 @@ impl HaloReader {
         let map = game_info_value.as_object_mut().unwrap();
         map.insert("map_resolution_inputs".to_string(), map_resolution_inputs);
         map.insert("spawn_parameters_hash".to_string(), spawn_hash);
+        map.insert(
+            "broken_surfaces".to_string(),
+            read_broken_surfaces(game_globals_map_loaded != 0, |address, len| {
+                self.mem.read_bytes(address, len)
+            }).unwrap_or(Value::Null),
+        );
 
         Ok(game_info_value)
     }
@@ -1959,6 +1965,21 @@ fn sort_json_value(value: &Value) -> Value {
     }
 }
 
+fn read_broken_surfaces(
+    map_loaded: bool,
+    mut read: impl FnMut(u64, usize) -> Result<Vec<u8>>,
+) -> Option<Value> {
+    if !map_loaded {
+        return None;
+    }
+    let pointer = u32::from_le_bytes(read(0x27824C, 4).ok()?.try_into().ok()?) as u64;
+    if pointer == 0 {
+        return None;
+    }
+    let intact = u32::from_le_bytes(read(pointer + 1, 4).ok()?.try_into().ok()?);
+    Some(json!(!intact))
+}
+
 fn read_utf16_from_bytes(bytes: &[u8]) -> String {
     let mut words = Vec::new();
     for chunk in bytes.chunks_exact(2) {
@@ -1969,4 +1990,76 @@ fn read_utf16_from_bytes(bytes: &[u8]) -> String {
         words.push(word);
     }
     String::from_utf16_lossy(&words)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const POINTER: u32 = 0x8006_2000;
+
+    #[test]
+    fn broken_surface_masks_match_python() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/breakable_surfaces.json"
+        )).unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let mut memory = [0xffu8; 5];
+            memory[0] = 0; // Damage-enable flag is not part of the mask.
+            for id in case["destroyed_ids"].as_array().unwrap() {
+                let id = id.as_u64().unwrap() as usize;
+                memory[1 + id / 8] &= !(1 << (id % 8));
+            }
+            let snapshot = read_broken_surfaces(true, |address, len| {
+                Ok(match address {
+                    0x27824C => POINTER.to_le_bytes().to_vec(),
+                    _ => {
+                        let start = address as usize - POINTER as usize;
+                        memory[start..start + len].to_vec()
+                    }
+                })
+            });
+            assert_eq!(snapshot, Some(case["snapshot"].clone()), "{}", case["name"]);
+        }
+    }
+
+    #[test]
+    fn broken_surface_guards_and_read_failures_return_unknown() {
+        assert!(read_broken_surfaces(false, |_, _| {
+            panic!("unloaded map must not read memory")
+        }).is_none());
+        assert!(read_broken_surfaces(true, |address, _| {
+            assert_eq!(address, 0x27824C);
+            Ok(0u32.to_le_bytes().to_vec())
+        }).is_none());
+        for failed_address in [0x27824C, POINTER as u64 + 1] {
+            for short_read in [false, true] {
+                let snapshot = read_broken_surfaces(true, |address, len| {
+                    if address == failed_address {
+                        return if short_read {
+                            Ok(vec![0; len - 1])
+                        } else {
+                            Err(anyhow::anyhow!("unreadable"))
+                        };
+                    }
+                    Ok(match address {
+                        0x27824C => POINTER.to_le_bytes().to_vec(),
+                        _ => panic!("unexpected read"),
+                    })
+                });
+                assert!(snapshot.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn zero_mask_means_all_destroyed() {
+        let snapshot = read_broken_surfaces(true, |address, len| {
+            Ok(match address {
+                0x27824C => POINTER.to_le_bytes().to_vec(),
+                _ => vec![0; len],
+            })
+        }).unwrap();
+        assert_eq!(snapshot, json!(u32::MAX));
+    }
 }

@@ -1187,6 +1187,7 @@ fn add_key_if_needed(payload: &mut Value, state: &RelayState) {
 
 fn strip_tick(data: &Value) -> Value {
     let mut root = Map::new();
+    copy_field(&mut root, data, "broken_surfaces");
     copy_field(&mut root, data, "game_type");
     copy_field(&mut root, data, "variant");
     copy_field(&mut root, data, "game_engine_has_teams");
@@ -1656,6 +1657,17 @@ fn utc_now_python_iso() -> String {
 mod tests {
     use super::*;
     use crate::runtime::RuntimeState;
+
+    #[test]
+    fn strip_tick_preserves_complete_breakable_snapshots_and_unknown() {
+        let fixture: Value = serde_json::from_str(include_str!("../../tests/fixtures/breakable_surfaces.json")).unwrap();
+        for snapshot in fixture["cases"].as_array().unwrap().iter()
+            .map(|case| case["snapshot"].clone()).chain([Value::Null]) {
+            let tick = json!({"broken_surfaces": snapshot});
+            assert_eq!(strip_tick(&tick), tick);
+        }
+        assert!(strip_tick(&json!({})).get("broken_surfaces").is_none());
+    }
 
     #[test]
     fn upload_status_is_created_and_updated_by_request_id() {

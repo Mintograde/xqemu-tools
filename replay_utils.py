@@ -116,6 +116,7 @@ necessary_fields = dict(
 
 necessary_fields_live = necessary_fields['ticks'].copy()
 necessary_fields_live.update(dict(
+    broken_surfaces={},
     events=necessary_fields['events'].copy(),
     spawns=necessary_fields['spawns'].copy(),
     items=necessary_fields['items'].copy(),

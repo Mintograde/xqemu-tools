@@ -2446,6 +2446,7 @@ def get_game_info():
                                                                        # 2 = postgame
                                                                        # 0 = picking map?
         map_info=get_map_info(),
+        broken_surfaces=(read_u32(breakable_globals + 1) ^ 0xFFFFFFFF) if game_globals_map_loaded and (breakable_globals := read_u32(0x27824C)) else None,
         game_connection=read_s16(0x2E3684),
         # network_game_client=read_u8(read_u32(0x2E362C)),
         game_engine_has_teams=read_u8(0x2F90C4),
